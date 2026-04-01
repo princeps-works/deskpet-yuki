@@ -9,6 +9,7 @@ import ctypes
 import json
 import time
 import queue
+import threading
 import multiprocessing as mp
 from ctypes import wintypes
 from difflib import SequenceMatcher
@@ -92,17 +93,46 @@ def _fingerprint_diff_ratio(a: bytes, b: bytes) -> float:
     return changed / len(a)
 
 
+def _resize_for_ocr(image, max_edge: int):
+    edge = int(max_edge)
+    if edge <= 0:
+        return image
+    width, height = image.size
+    longest = max(width, height)
+    if longest <= edge:
+        return image
+    ratio = float(edge) / float(longest)
+    new_w = max(1, int(round(width * ratio)))
+    new_h = max(1, int(round(height * ratio)))
+    return image.resize((new_w, new_h))
+
+
 def run_scan_pipeline_subprocess(
     scan_monitor_index: int,
     scan_region: tuple[int, int, int, int] | None,
+    ocr_cpu_threads: int = 0,
+    ocr_cpu_affinity_count: int = 0,
+    ocr_max_edge: int = 0,
 ) -> dict:
     try:
         import psutil
 
         proc = psutil.Process(os.getpid())
         proc.nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)
+        if int(ocr_cpu_affinity_count) > 0 and hasattr(proc, "cpu_affinity"):
+            current = list(proc.cpu_affinity())
+            if current:
+                proc.cpu_affinity(current[: int(ocr_cpu_affinity_count)])
     except Exception:
         pass
+
+    if int(ocr_cpu_threads) > 0:
+        thread_value = str(int(ocr_cpu_threads))
+        os.environ["OMP_NUM_THREADS"] = thread_value
+        os.environ["MKL_NUM_THREADS"] = thread_value
+        os.environ["OPENBLAS_NUM_THREADS"] = thread_value
+        os.environ["NUMEXPR_NUM_THREADS"] = thread_value
+        os.environ["ORT_NUM_THREADS"] = thread_value
 
     from desktop_pet.vision.capture import capture_primary_screen
     from desktop_pet.vision.ocr import extract_text, get_ocr_runtime_status
@@ -125,7 +155,8 @@ def run_scan_pipeline_subprocess(
             }
 
     ocr_ok, ocr_info = get_ocr_runtime_status()
-    ocr_text = extract_text(image)
+    ocr_image = _resize_for_ocr(image, int(ocr_max_edge))
+    ocr_text = extract_text(ocr_image)
     screen_context = f"OCR文本: {ocr_text}" if ocr_text else ""
     scene = analyze_scene(screen_context)
     mode = "ocr" if ocr_text else "none"
@@ -155,9 +186,18 @@ def run_scan_pipeline_worker_loop(task_queue, result_queue) -> None:
         task_id = int(task.get("task_id", 0))
         monitor_index = int(task.get("scan_monitor_index", 1))
         scan_region = task.get("scan_region")
+        ocr_cpu_threads = int(task.get("ocr_cpu_threads", 0))
+        ocr_cpu_affinity_count = int(task.get("ocr_cpu_affinity_count", 0))
+        ocr_max_edge = int(task.get("ocr_max_edge", 0))
         started_ts = time.time()
         try:
-            result = run_scan_pipeline_subprocess(monitor_index, scan_region)
+            result = run_scan_pipeline_subprocess(
+                monitor_index,
+                scan_region,
+                ocr_cpu_threads=ocr_cpu_threads,
+                ocr_cpu_affinity_count=ocr_cpu_affinity_count,
+                ocr_max_edge=ocr_max_edge,
+            )
             result_queue.put(
                 {
                     "task_id": task_id,
@@ -188,6 +228,33 @@ def main() -> int:
 
     live2d_py_process = None
     live2d_py_retry_used = False
+    filter_motion_noise_log = os.getenv("LIVE2D_FILTER_MOTION_NOISE_LOG", "1").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+    def _pipe_live2d_stream(stream, *, name: str) -> None:
+        if stream is None:
+            return
+        try:
+            for raw_line in stream:
+                line = raw_line.rstrip("\r\n")
+                if not line:
+                    continue
+                lowered = line.lower()
+                noisy_motion = ("start motion" in lowered) and (("can't" in lowered) or ("cant" in lowered))
+                if filter_motion_noise_log and noisy_motion:
+                    continue
+                print(f"[LIVE2D-PY/{name}] {line}")
+        except Exception as exc:
+            print(f"[STARTUP] Live2D-py log pipe {name} failed: {exc}")
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
 
     def start_live2d_py_process(*, force_gl_init: bool) -> subprocess.Popen | None:
         child_env = os.environ.copy()
@@ -215,7 +282,32 @@ def main() -> int:
             "--window-drag",
             "0",
         ]
-        return subprocess.Popen(cmd, cwd=str(base_dir.parent), env=child_env)
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(base_dir.parent),
+            env=child_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+        if proc.stdout is not None:
+            threading.Thread(
+                target=_pipe_live2d_stream,
+                args=(proc.stdout,),
+                kwargs={"name": "STDOUT"},
+                daemon=True,
+            ).start()
+        if proc.stderr is not None:
+            threading.Thread(
+                target=_pipe_live2d_stream,
+                args=(proc.stderr,),
+                kwargs={"name": "STDERR"},
+                daemon=True,
+            ).start()
+        return proc
 
     if settings.enable_live2d_py:
         try:
@@ -349,14 +441,34 @@ def main() -> int:
         if tts_text:
             speech.speak(tts_text)
 
+    def _speak_async_with_callback(display_text: str, on_start=None) -> None:
+        tts_text = prepare_tts_text(display_text)
+        if not tts_text:
+            if callable(on_start):
+                on_start()
+            return
+        queued = speech.speak(tts_text, on_start=on_start)
+        if (not queued) and callable(on_start):
+            on_start()
+
     def show_and_speak(display_text: str, *, role: str | None = None, duration_ms: int | None = None) -> None:
-        if role is not None:
-            chat.append_message(role, display_text)
-
         bubble_ms = duration_ms if duration_ms is not None else estimate_bubble_duration_ms(display_text)
-        pet.show_comment_bubble(display_text, duration_ms=bubble_ms)
 
-        tts_executor.submit(_speak_async, display_text)
+        shown_lock = threading.Lock()
+        shown_state = {"done": False}
+
+        def _emit_ui_once() -> None:
+            with shown_lock:
+                if shown_state["done"]:
+                    return
+                shown_state["done"] = True
+            if role is not None:
+                chat.append_message(role, display_text)
+            pet.show_comment_bubble(display_text, duration_ms=bubble_ms)
+
+        # Fallback: if TTS generation/playback is blocked, still show message after a short wait.
+        QTimer.singleShot(2200, _emit_ui_once)
+        tts_executor.submit(_speak_async_with_callback, display_text, lambda: QTimer.singleShot(0, _emit_ui_once))
 
     def speak_text(text: str) -> None:
         tts_executor.submit(_speak_async, text)
@@ -474,6 +586,10 @@ def main() -> int:
     drag_lock_last_rect = None
     drag_lock_last_write_ts = 0.0
     last_zorder_sync_ts = 0.0
+    resource_policy_heavy_scan_interval_sec = 20.0
+    voicevox_pid_cache = 0
+    voicevox_policy_last_scan_ts = 0.0
+    proc_policy_cache: dict[int, tuple[object, tuple[int, ...]]] = {}
 
     def _apply_runtime_resource_policy(
         scan_active: bool,
@@ -485,6 +601,7 @@ def main() -> int:
         nonlocal resource_policy_last_apply_ts, resource_policy_last_mode
         nonlocal resource_policy_last_switch_ts
         nonlocal resource_policy_follow_grace_until_ts, resource_policy_drag_grace_until_ts
+        nonlocal voicevox_pid_cache, voicevox_policy_last_scan_ts
         if os.name != "nt":
             return
 
@@ -535,12 +652,7 @@ def main() -> int:
                 p = psutil.Process(int(pid))
                 if not p.is_running():
                     return
-                try:
-                    cur = p.nice()
-                except Exception:
-                    cur = None
-                if cur != cls:
-                    p.nice(cls)
+                p.nice(cls)
             except Exception:
                 pass
 
@@ -551,14 +663,22 @@ def main() -> int:
                 p = psutil.Process(int(pid))
                 if not p.is_running() or not hasattr(p, "cpu_affinity"):
                     return
-                try:
-                    cur = list(p.cpu_affinity())
-                except Exception:
-                    cur = []
-                if sorted(cur) != sorted(cpu_ids):
-                    p.cpu_affinity(cpu_ids)
+                p.cpu_affinity(cpu_ids)
             except Exception:
                 pass
+
+        def _apply_proc_policy_cached(pid: int, cls, cpu_ids: list[int]) -> None:
+            if not pid:
+                return
+            target_affinity = tuple(sorted(int(x) for x in cpu_ids)) if cpu_ids else tuple()
+            target = (cls, target_affinity)
+            prev = proc_policy_cache.get(int(pid))
+            if (not force) and prev == target:
+                return
+            _set_proc_priority(pid, cls)
+            if cpu_ids:
+                _set_proc_affinity(pid, cpu_ids)
+            proc_policy_cache[int(pid)] = target
 
         # Keep main UI responsive while scan worker does heavy OCR.
         if mode == "drag_priority":
@@ -592,35 +712,48 @@ def main() -> int:
             scan_affinity = all_cpu_ids
             live2d_affinity = all_cpu_ids
 
-        _set_proc_priority(os.getpid(), main_cls)
-        if all_cpu_ids:
-            _set_proc_affinity(os.getpid(), all_cpu_ids)
+        _apply_proc_policy_cached(os.getpid(), main_cls, all_cpu_ids)
 
         # scan worker is a persistent standalone process when subprocess mode is enabled.
         try:
             if settings.enable_scan_subprocess:
                 if scan_worker_process is not None and scan_worker_process.is_alive():
-                    _set_proc_priority(int(scan_worker_process.pid), scan_cls)
-                    _set_proc_affinity(int(scan_worker_process.pid), scan_affinity)
+                    _apply_proc_policy_cached(int(scan_worker_process.pid), scan_cls, scan_affinity)
         except Exception:
             pass
 
         # Follow process priority is controlled by mode.
         if live2d_py_process is not None and live2d_py_process.poll() is None:
-            _set_proc_priority(int(live2d_py_process.pid), live2d_cls)
-            _set_proc_affinity(int(live2d_py_process.pid), live2d_affinity)
+            _apply_proc_policy_cached(int(live2d_py_process.pid), live2d_cls, live2d_affinity)
 
         # Keep VOICEVOX at normal as requested, even in OCR-priority mode.
+        # Use cached pid and low-frequency full scan to reduce periodic spikes.
         try:
-            for proc in psutil.process_iter(attrs=["pid", "name", "exe", "cmdline"]):
-                name = str((proc.info.get("name") or "")).lower()
-                exe = str((proc.info.get("exe") or "")).lower()
-                cmdline = " ".join(proc.info.get("cmdline") or []).lower()
-                if name != "run.exe":
-                    continue
-                if "voicevox" not in exe and "voicevox" not in cmdline and "vv-engine" not in exe and "vv-engine" not in cmdline:
-                    continue
-                _set_proc_priority(int(proc.info.get("pid") or 0), normal_cls)
+            if voicevox_pid_cache > 0:
+                try:
+                    proc = psutil.Process(int(voicevox_pid_cache))
+                    if proc.is_running() and str(proc.name()).lower() == "run.exe":
+                        _apply_proc_policy_cached(int(voicevox_pid_cache), normal_cls, [])
+                    else:
+                        voicevox_pid_cache = 0
+                except Exception:
+                    voicevox_pid_cache = 0
+
+            need_full_scan = force or voicevox_pid_cache <= 0 or (now_ts - voicevox_policy_last_scan_ts >= resource_policy_heavy_scan_interval_sec)
+            if need_full_scan:
+                voicevox_policy_last_scan_ts = now_ts
+                for proc in psutil.process_iter(attrs=["pid", "name", "exe", "cmdline"]):
+                    name = str((proc.info.get("name") or "")).lower()
+                    exe = str((proc.info.get("exe") or "")).lower()
+                    cmdline = " ".join(proc.info.get("cmdline") or []).lower()
+                    if name != "run.exe":
+                        continue
+                    if "voicevox" not in exe and "voicevox" not in cmdline and "vv-engine" not in exe and "vv-engine" not in cmdline:
+                        continue
+                    voicevox_pid_cache = int(proc.info.get("pid") or 0)
+                    if voicevox_pid_cache > 0:
+                        _apply_proc_policy_cached(voicevox_pid_cache, normal_cls, [])
+                        break
         except Exception:
             pass
 
@@ -690,6 +823,9 @@ def main() -> int:
             "task_id": int(scan_task_seq),
             "scan_monitor_index": int(scan_monitor_index),
             "scan_region": scan_region,
+            "ocr_cpu_threads": int(settings.ocr_cpu_threads),
+            "ocr_cpu_affinity_count": int(settings.ocr_cpu_affinity_count),
+            "ocr_max_edge": int(settings.ocr_max_edge),
         }
         try:
             scan_task_queue.put_nowait(payload)
@@ -815,7 +951,8 @@ def main() -> int:
                     parts.append(f"视觉摘要: {visual_summary}")
                     mode = "vision"
 
-        ocr_text = extract_text(image)
+        ocr_image = _resize_for_ocr(image, int(settings.ocr_max_edge))
+        ocr_text = extract_text(ocr_image)
         if ocr_text:
             parts.append(f"OCR文本: {ocr_text}")
             mode = "vision+ocr" if mode == "vision" else "ocr"
@@ -1442,7 +1579,7 @@ def main() -> int:
                 return
 
             # Keep follow responsive even when OCR is busy; avoid near-stop behavior.
-            if scan_busy and (now_ts - last_input_write_ts) < 0.24:
+            if scan_busy and (now_ts - last_input_write_ts) < 0.12:
                 return
 
             pt = wintypes.POINT()
@@ -1456,8 +1593,8 @@ def main() -> int:
 
             left_down = 1 if (user32.GetAsyncKeyState(0x01) & 0x8000) else 0
             right_down = 1 if (user32.GetAsyncKeyState(0x02) & 0x8000) else 0
-            min_interval = 0.22 if scan_busy else 0.06
-            keepalive_interval = 1.2 if scan_busy else 0.6
+            min_interval = 0.12 if scan_busy else 0.06
+            keepalive_interval = 0.7 if scan_busy else 0.6
             signature = (
                 local_x,
                 local_y,
@@ -1705,8 +1842,6 @@ def main() -> int:
                     print(f"[STARTUP] Live2D-py auto relaunch failed: {exc}")
             if host_hwnd:
                 _raise_topmost(user32, host_hwnd)
-            if chat_hwnd:
-                _raise_topmost(user32, chat_hwnd, host_hwnd)
             return
 
         try:
@@ -1780,8 +1915,6 @@ def main() -> int:
                 0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
             )
-            if chat.isVisible():
-                _raise_topmost(user32, chat_hwnd, host_hwnd)
             last_zorder_sync_ts = now_ts
 
     if settings.enable_scan_subprocess:

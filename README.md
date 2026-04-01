@@ -36,6 +36,7 @@ Adjustable env categories:
 
 5. Live2D / Render
 - WebEngine mode, Live2D backend switches, model path, follow behavior, scale and idle group.
+- Includes runner diagnostics and motion-noise log filtering switches.
 
 6. Scan Target and Scheduler
 - Monitor/region selection, scan tick interval, submit interval, busy timeout, subprocess mode.
@@ -59,6 +60,9 @@ Adjustable env categories:
 
 - Install dependency first: `pip install PyQt6-WebEngine`.
 - If Live2D backend is unavailable, app falls back to static `pet.png` rendering.
+- `LIVE2D_INPUT_DIAG=0` by default. Set to `1` only when debugging input-follow snapshots.
+- `LIVE2D_FILTER_MOTION_NOISE_LOG=1` by default. It suppresses noisy `can't start motion` lines when actions still execute normally.
+- If you want full raw native logs for deep troubleshooting, set `LIVE2D_FILTER_MOTION_NOISE_LOG=0`.
 
 ## TTS Notes
 
@@ -101,6 +105,9 @@ SCAN_REGION=200,120,1200,700
 SCAN_TICK_INTERVAL_SEC=10
 SCAN_SUBMIT_MIN_INTERVAL_SEC=15
 SCAN_BUSY_TIMEOUT_SEC=10
+OCR_CPU_THREADS=2
+OCR_CPU_AFFINITY_COUNT=2
+OCR_MAX_EDGE=960
 SCREEN_SCAN_INTERVAL_SEC=60
 AUTO_COMMENT_COOLDOWN_SEC=80
 LIVE2D_FOLLOW_CURSOR=true
@@ -148,4 +155,7 @@ AUTO_COMMENT_STYLE_WEIGHTS=陪伴评论:1.2,轻松提问:0.8,俏皮打趣:0.5,�
 
 - `SCAN_REGION` is one of the highest-impact settings for smoothness.
 - If stutter appears, first increase `SCAN_SUBMIT_MIN_INTERVAL_SEC` and `SCREEN_SCAN_INTERVAL_SEC`.
+- If CPU spikes remain high, tune `OCR_CPU_THREADS`, `OCR_CPU_AFFINITY_COUNT`, and `OCR_MAX_EDGE`.
+- `OCR_CPU_THREADS` is applied directly to RapidOCR init (`intra/inter op threads`); restart app after changing it.
+- You can try GPU OCR path with `OCR_USE_DML=true` (Windows) or `OCR_USE_CUDA=true` when runtime supports it.
 - For unstable vision APIs, keep `ENABLE_MM_COMPAT_MODE=true` to preserve OCR fallback.

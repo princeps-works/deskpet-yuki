@@ -12,6 +12,7 @@ import time
 from html import escape
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable, Optional
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -36,6 +37,7 @@ except Exception:  # pragma: no cover
 @dataclass
 class _SpeechTask:
     text: str
+    on_start: Optional[Callable[[], None]] = None
 
 
 class SpeechService:
@@ -79,6 +81,10 @@ class SpeechService:
         if self._provider == "voicevox":
             if pygame is None or not self._voicevox_base_url:
                 return False
+            assets_ok, assets_detail = self._check_voicevox_assets()
+            if not assets_ok:
+                self._voicevox_status_detail = assets_detail
+                return False
             ok, detail = self._check_voicevox_engine()
             if not ok and self._enable_voicevox_auto_launch:
                 launched, launch_detail = self._try_launch_voicevox_engine()
@@ -93,6 +99,44 @@ class SpeechService:
             self._voicevox_status_detail = detail
             return ok
         return False
+
+    def _check_voicevox_assets(self) -> tuple[bool, str]:
+        try:
+            engine_dir = self._voicevox_engine_path.parent
+            model_dir = engine_dir / "model"
+            if not model_dir.exists():
+                return False, f"voicevox model dir not found: {model_dir}"
+
+            vvm_files = sorted(model_dir.glob("*.vvm"))
+            if not vvm_files:
+                return False, f"voicevox model files not found under: {model_dir}"
+
+            # Validate a few files to avoid long startup waits when model files are LFS pointers.
+            probe_files = vvm_files[: min(3, len(vvm_files))]
+            for file_path in probe_files:
+                try:
+                    size = file_path.stat().st_size
+                except Exception:
+                    return False, f"voicevox model unreadable: {file_path.name}"
+
+                if size < 1024 * 1024:
+                    try:
+                        head = file_path.read_text(encoding="utf-8", errors="ignore")[:120]
+                    except Exception:
+                        head = ""
+                    if "git-lfs.github.com/spec/v1" in head:
+                        return (
+                            False,
+                            (
+                                "voicevox model appears to be Git LFS pointer; "
+                                "run 'git lfs pull' in project root"
+                            ),
+                        )
+                    return False, f"voicevox model file too small: {file_path.name} ({size} bytes)"
+
+            return True, "voicevox assets ok"
+        except Exception as exc:
+            return False, f"voicevox asset check failed: {exc}"
 
     def _build_status_message(self) -> str:
         if not self._enabled:
@@ -163,17 +207,18 @@ class SpeechService:
     def get_status(self) -> tuple[bool, str]:
         return self._runtime_ok, self._status_message
 
-    def speak(self, text: str) -> None:
+    def speak(self, text: str, on_start: Optional[Callable[[], None]] = None) -> bool:
         if not self._runtime_ok:
-            return
+            return False
         if self._muted:
-            return
+            return False
         cleaned = self._clean_text(text)
         if not cleaned:
-            return
+            return False
         self.stop_current()
         self._clear_queue()
-        self._queue.put(_SpeechTask(cleaned))
+        self._queue.put(_SpeechTask(cleaned, on_start=on_start))
+        return True
 
     def set_muted(self, muted: bool) -> None:
         self._muted = muted
@@ -239,22 +284,31 @@ class SpeechService:
             if task is None:
                 return
             try:
-                self._speak_once(task.text)
+                self._speak_once(task.text, task.on_start)
             except Exception:
                 # Do not break app flow on TTS failures.
                 pass
 
-    def _speak_once(self, text: str) -> None:
+    def _speak_once(self, text: str, on_start: Optional[Callable[[], None]] = None) -> None:
         if self._provider == "edge":
-            self._speak_edge(text)
+            self._speak_edge(text, on_start=on_start)
             return
         if self._provider == "voicevox":
-            self._speak_voicevox(text)
+            self._speak_voicevox(text, on_start=on_start)
             return
         if self._provider == "azure":
-            self._speak_azure(text)
+            self._speak_azure(text, on_start=on_start)
 
-    def _speak_edge(self, text: str) -> None:
+    @staticmethod
+    def _notify_on_start(on_start: Optional[Callable[[], None]]) -> None:
+        if on_start is None:
+            return
+        try:
+            on_start()
+        except Exception:
+            pass
+
+    def _speak_edge(self, text: str, on_start: Optional[Callable[[], None]] = None) -> None:
         fd, tmp_path = tempfile.mkstemp(prefix="pet_tts_", suffix=".mp3")
         os.close(fd)
         try:
@@ -263,6 +317,7 @@ class SpeechService:
                 if not pygame.mixer.get_init():
                     return
                 pygame.mixer.music.load(tmp_path)
+                self._notify_on_start(on_start)
                 pygame.mixer.music.play()
 
             while True:
@@ -277,7 +332,7 @@ class SpeechService:
             except OSError:
                 pass
 
-    def _speak_voicevox(self, text: str) -> None:
+    def _speak_voicevox(self, text: str, on_start: Optional[Callable[[], None]] = None) -> None:
         query = self._voicevox_audio_query(text)
         wav_bytes = self._voicevox_synthesis(query)
 
@@ -291,6 +346,7 @@ class SpeechService:
                 if not pygame.mixer.get_init():
                     return
                 pygame.mixer.music.load(tmp_path)
+                self._notify_on_start(on_start)
                 pygame.mixer.music.play()
 
             while True:
@@ -345,11 +401,12 @@ class SpeechService:
         self._azure_synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config)
         return self._azure_synthesizer
 
-    def _speak_azure(self, text: str) -> None:
+    def _speak_azure(self, text: str, on_start: Optional[Callable[[], None]] = None) -> None:
         synth = self._get_azure_synthesizer()
         if synth is None:
             return
         ssml = self._build_azure_ssml(text)
+        self._notify_on_start(on_start)
         result = synth.speak_ssml_async(ssml).get()
         if speechsdk is None:
             return

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+import os
 import time
 from typing import Any
 
@@ -32,7 +33,21 @@ def _ensure_engine() -> None:
         return
 
     try:
-        _engine = RapidOCR()
+        kwargs: dict[str, Any] = {}
+        # Explicitly pass RapidOCR thread knobs; this is more reliable than generic OMP env vars.
+        threads = int(os.getenv("OCR_CPU_THREADS", "0") or 0)
+        if threads > 0:
+            kwargs["intra_op_num_threads"] = max(1, threads)
+            kwargs["inter_op_num_threads"] = 1
+
+        use_dml = os.getenv("OCR_USE_DML", "false").lower() in {"1", "true", "yes", "on"}
+        use_cuda = os.getenv("OCR_USE_CUDA", "false").lower() in {"1", "true", "yes", "on"}
+        if use_dml:
+            kwargs["use_dml"] = True
+        if use_cuda:
+            kwargs["use_cuda"] = True
+
+        _engine = RapidOCR(**kwargs)
         _engine_init_error = ""
     except Exception as exc:  # pragma: no cover
         _engine_init_error = f"RapidOCR init failed: {exc}"

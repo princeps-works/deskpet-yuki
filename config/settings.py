@@ -48,6 +48,9 @@ class Settings:
     scan_tick_interval_sec: int
     scan_submit_min_interval_sec: int
     scan_busy_timeout_sec: int
+    ocr_cpu_threads: int
+    ocr_cpu_affinity_count: int
+    ocr_max_edge: int
     resource_policy_hard_after_sec: float
     resource_policy_release_grace_sec: float
     resource_policy_reapply_min_sec: float
@@ -203,6 +206,12 @@ def load_settings(base_dir: Path) -> Settings:
     scan_submit_min_interval_sec = max(0, scan_submit_min_interval_sec)
     scan_busy_timeout_sec = int(os.getenv("SCAN_BUSY_TIMEOUT_SEC", "12"))
     scan_busy_timeout_sec = max(5, scan_busy_timeout_sec)
+    ocr_cpu_threads = int(os.getenv("OCR_CPU_THREADS", "0"))
+    ocr_cpu_threads = max(0, min(64, ocr_cpu_threads))
+    ocr_cpu_affinity_count = int(os.getenv("OCR_CPU_AFFINITY_COUNT", "0"))
+    ocr_cpu_affinity_count = max(0, min(64, ocr_cpu_affinity_count))
+    ocr_max_edge = int(os.getenv("OCR_MAX_EDGE", "0"))
+    ocr_max_edge = max(0, min(4096, ocr_max_edge))
     resource_policy_hard_after_sec = float(os.getenv("RESOURCE_POLICY_HARD_AFTER_SEC", "2.5"))
     resource_policy_hard_after_sec = max(0.5, min(30.0, resource_policy_hard_after_sec))
     resource_policy_release_grace_sec = float(os.getenv("RESOURCE_POLICY_RELEASE_GRACE_SEC", "1.2"))
@@ -325,6 +334,9 @@ def load_settings(base_dir: Path) -> Settings:
         scan_tick_interval_sec=scan_tick_interval_sec,
         scan_submit_min_interval_sec=scan_submit_min_interval_sec,
         scan_busy_timeout_sec=scan_busy_timeout_sec,
+        ocr_cpu_threads=ocr_cpu_threads,
+        ocr_cpu_affinity_count=ocr_cpu_affinity_count,
+        ocr_max_edge=ocr_max_edge,
         resource_policy_hard_after_sec=resource_policy_hard_after_sec,
         resource_policy_release_grace_sec=resource_policy_release_grace_sec,
         resource_policy_reapply_min_sec=resource_policy_reapply_min_sec,

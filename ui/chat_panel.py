@@ -22,6 +22,45 @@ from desktop_pet.llm.dialog_manager import DialogManager
 from desktop_pet.vision.ocr import extract_text
 
 
+class DiaryWindow(QWidget):
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setWindowFlags(
+            Qt.WindowType.Window
+            | Qt.WindowType.WindowMinMaxButtonsHint
+            | Qt.WindowType.WindowCloseButtonHint
+        )
+        self.setWindowTitle("长期记忆日记")
+        self.resize(560, 420)
+
+        self.title_label = QLabel("最近长期记忆", self)
+        self.diary_text = QTextEdit(self)
+        self.diary_text.setReadOnly(True)
+
+        self.close_btn = QPushButton("关闭", self)
+        self.close_btn.clicked.connect(self.close)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.title_label)
+        layout.addWidget(self.diary_text, 1)
+        layout.addWidget(self.close_btn)
+
+    def set_entries(self, entries: list[dict]):
+        if not entries:
+            self.diary_text.setPlainText("暂无长期记忆日记。")
+            return
+
+        lines: list[str] = ["以下为最近长期记忆日记：", ""]
+        for idx, item in enumerate(reversed(entries), start=1):
+            ts = str(item.get("timestamp", "") or "").strip()
+            summary = str(item.get("summary", "") or "").strip()
+            if ts:
+                lines.append(f"{idx}. [{ts}] {summary}")
+            else:
+                lines.append(f"{idx}. {summary}")
+        self.diary_text.setPlainText("\n".join(lines))
+
+
 class ChatPanel(QWidget):
     def __init__(self, dialog_manager: DialogManager, on_pet_reply: Optional[Callable[[str], None]] = None):
         super().__init__()
@@ -34,6 +73,7 @@ class ChatPanel(QWidget):
         self._pending_task_type: str | None = None
         self._uploaded_image_path: str = ""
         self._uploaded_image_ocr_text: str = ""
+        self.diary_window = DiaryWindow(None)
         self.setWindowTitle("桌宠聊天")
         self.resize(420, 520)
 
@@ -98,10 +138,7 @@ class ChatPanel(QWidget):
 
     def enable_live2d_overlay_mode(self):
         self.overlay_mode = True
-        self.setWindowFlags(
-            Qt.WindowType.Window
-            | Qt.WindowType.WindowStaysOnTopHint
-        )
+        self.setWindowFlags(Qt.WindowType.Window)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
         self.resize(460, 700)
         self.setStyleSheet(
@@ -354,18 +391,10 @@ class ChatPanel(QWidget):
 
     def on_view_diary(self):
         entries = self.dialog_manager.list_long_memory(limit=10)
-        if not entries:
-            self.append_message("系统", "暂无长期记忆日记。")
-            return
-
-        self.append_message("系统", "以下为最近长期记忆日记：")
-        for idx, item in enumerate(reversed(entries), start=1):
-            ts = item.get("timestamp", "")
-            summary = item.get("summary", "")
-            if ts:
-                self.append_message("日记", f"{idx}. [{ts}] {summary}")
-            else:
-                self.append_message("日记", f"{idx}. {summary}")
+        self.diary_window.set_entries(entries)
+        self.diary_window.show()
+        self.diary_window.raise_()
+        self.diary_window.activateWindow()
 
     def show_and_focus(self):
         self.show()
