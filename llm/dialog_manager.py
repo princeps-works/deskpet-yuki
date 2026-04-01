@@ -75,6 +75,22 @@ class DialogManager:
                 lines.append(f"{role}: {text}")
         return "\n".join(lines)
 
+    def build_recent_session_hint(self, limit: int = 8) -> str:
+        if not self._session_messages:
+            return ""
+
+        max_items = max(1, limit)
+        picked = self._session_messages[-max_items:]
+        lines: list[str] = []
+        for item in picked:
+            role = str(item.get("role", "")).strip()
+            text = str(item.get("text", "")).strip()
+            if role and text:
+                lines.append(f"{role}: {text}")
+        if not lines:
+            return ""
+        return "近期对话片段（用于语气和连续性参考）:\n" + "\n".join(lines)
+
     def start_new_chat(self) -> int:
         self._session_messages = []
         return len(self._load_memory_entries())

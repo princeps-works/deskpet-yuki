@@ -12,78 +12,58 @@
    python main.py
    ```
 
-## Multimodal Vision Branch
+## Config Overview
 
-- `ENABLE_MULTIMODAL_VISION=true` to enable screenshot vision understanding.
-- `VISION_MODEL_NAME` can be set to a model that supports image input.
-- If vision analysis fails, the app automatically falls back to OCR-only behavior.
+All detailed parameter definitions, defaults, value ranges, and examples are centralized in:
 
-## Scan Target Configuration
+- `.env.example`
 
-- `SCAN_MONITOR_INDEX=1` means capture display #1 (external monitor can be 2, 3, ...).
-- `SCAN_REGION=left,top,width,height` limits scanning to a rectangle on the selected monitor.
-- Leave `SCAN_REGION=` empty to scan the whole selected monitor.
-- `SCAN_TICK_INTERVAL_SEC=0` controls high-frequency scan ticks for memory accumulation.
-   - `0` means auto-calc from `SCREEN_SCAN_INTERVAL_SEC`.
-   - positive integer means fixed tick interval in seconds (e.g. `8`).
-- `SCAN_SUBMIT_MIN_INTERVAL_SEC=0` controls minimum interval between scan task submissions.
-   - `0` means auto-calc.
-   - positive integer limits OCR submit frequency (recommended `12` to `25` when subprocess mode is enabled).
-- `SCAN_BUSY_TIMEOUT_SEC=12` controls how long a scan task can remain busy before force-resetting scan workers.
-- In subprocess mode, near-identical frames can reuse previous OCR analysis to keep sample cadence high while reducing CPU load.
-- `MEMORY_RECENCY_WINDOW_SEC=0` controls weighted-memory recency window.
-   - `0` means auto-calc from comment interval.
-   - positive integer means custom recency window in seconds.
-- `MEMORY_MIN_WEIGHT=0.15` controls the minimum retained weight for older memory items (`0.0` to `1.0`).
-- `ENABLE_SCAN_SUBPROCESS=true` runs auto scan pipeline in a dedicated subprocess to reduce UI/Live2D contention.
-- `SCREEN_COMMENT_MEMORY_LIMIT=3` controls how many long-memory entries are included in screen comments.
-   - `0` disables long-memory hint for screen comments.
-- `SCREEN_COMMENT_MEMORY_WEIGHT=0.2` controls suggested long-memory influence in screen-comment prompting (`0.0` to `1.0`).
-- `COMMENT_SIMILARITY_SKIP_THRESHOLD=0.86` skips emitting auto comments that are too similar to the previous one.
+`README` only keeps category-level guidance to stay clean.
 
-## Live2D Model Display
+Adjustable env categories:
+
+1. LLM / API
+- API keys, base URL, text model, vision model.
+
+2. Multimodal Scan Pipeline
+- Vision enable switches, compatibility fallback, timeout/failure/cooldown, image resize edge.
+
+3. Runtime Behavior
+- Heartbeat log switch, tutor persona startup switch.
+
+4. TTS
+- Provider selection, voice/rate/volume, Azure settings, VOICEVOX settings.
+
+5. Live2D / Render
+- WebEngine mode, Live2D backend switches, model path, follow behavior, scale and idle group.
+
+6. Scan Target and Scheduler
+- Monitor/region selection, scan tick interval, submit interval, busy timeout, subprocess mode.
+
+7. Windows Resource Policy
+- OCR hard mode threshold, recovery grace, minimum policy reapply interval.
+
+8. Memory and Comment Policy
+- Memory recency/weight, long-memory injection, similarity skip threshold, scan/comment cadence.
+
+9. Auto Comment Style and Emotion Tuning
+- Style base weights and emotion keyword dictionaries.
+- Auto comments jointly consider: scan memory, recent dialog, and long-memory hints.
+
+## Multimodal Notes
+
+- If vision analysis fails or times out, the app can fall back to OCR path in compatibility mode.
+- For low-end devices, prioritize region scan + larger submit interval.
+
+## Live2D Notes
 
 - Install dependency first: `pip install PyQt6-WebEngine`.
-- `WEBENGINE_GPU_MODE=gpu` controls WebEngine render mode for Live2D:
-   - `gpu`: prefer GPU acceleration (recommended default).
-   - `software`: force software rendering for compatibility testing.
-   - `auto`: do not inject extra Chromium flags.
-- `ENABLE_LIVE2D=true` enables WebEngine-based Live2D rendering.
-- `LIVE2D_MODEL_JSON` points to your `*.model3.json` file.
-   - Example: `G:\py\桌宠\皮套\mao_pro_zh\runtime\mao_pro.model3.json`
-- `ENABLE_LIVE2D_PY=true` enables integrated `live2d-py` renderer process mode.
-   - In this mode, WebEngine Live2D rendering is automatically disabled to avoid dual-render contention.
-   - The main pet host window becomes a transparent top control bar and is auto-docked with the Live2D window.
-   - Chat panel switches to frameless overlay style and follows the Live2D window position.
-- `LIVE2D_FOLLOW_CURSOR=true` enables gaze follow (mouse tracking).
-- `LIVE2D_MODEL_SCALE=1.0` controls model scale (recommended `0.8` to `1.4`).
-- `LIVE2D_IDLE_GROUP=Idle` sets preferred idle motion group name.
-- `ENABLE_LIVE2D_PY_POC=true` is kept as a backward-compatible alias for `ENABLE_LIVE2D_PY=true`.
-- `LIVE2D_PY_WINDOW_WIDTH` / `LIVE2D_PY_WINDOW_HEIGHT` controls PoC renderer window size.
-   - Default is reduced to half-size (`280x430`) for lighter load.
-- Interaction:
-   - Left-click on model triggers tap reaction (head/body hit-area attempt).
-   - Mouse move updates model focus direction when follow is enabled.
-- Fallback behavior:
-   - If WebEngine dependency is missing or model path is invalid, app falls back to static `pet.png` rendering.
+- If Live2D backend is unavailable, app falls back to static `pet.png` rendering.
 
-## Speech Output
+## TTS Notes
 
-- `ENABLE_TTS=true` enables text-to-speech playback for pet replies.
-- `TTS_PROVIDER=edge` uses Edge TTS (local synthesis + local playback).
-- `TTS_PROVIDER=azure` uses Azure Speech service.
-- `TTS_PROVIDER=voicevox` uses local VOICEVOX Engine HTTP API.
-- `TTS_VOICE=zh-CN-XiaoxiaoNeural` selects voice for both providers.
-- `TTS_RATE` and `TTS_VOLUME` support percent format like `+0%`, `-10%`, `+20%`.
-- Azure required vars when provider is `azure`:
-   - `TTS_AZURE_KEY`
-   - `TTS_AZURE_REGION` (or `TTS_AZURE_ENDPOINT`)
-- VOICEVOX required vars when provider is `voicevox`:
-   - `TTS_VOICEVOX_BASE_URL` (default `http://127.0.0.1:50021`)
-   - `TTS_VOICEVOX_SPEAKER` (style/speaker id)
-   - `ENABLE_VOICEVOX_AUTO_LAUNCH` (default `true`, auto-starts local engine if port is down)
-   - `TTS_VOICEVOX_ENGINE_PATH` (path to `run.exe`)
-   - `ENABLE_VOICEVOX_JA_TRANSLATION` (default `true`, translates Chinese text to Japanese before synthesis)
+- `edge` is the easiest default provider.
+- Use Azure/VOICEVOX when you need specific voice quality or local engine control.
 
 ## VOICEVOX Install on G Drive
 
@@ -107,3 +87,65 @@
 - Wire `vision.capture` + `vision.scene_analyzer` to timed auto-comment
 - Replace placeholder Live2D driver with actual runtime bridge
 - Add system tray controls and settings panel
+
+## Env Quick Reference
+
+Copy the following presets into your `.env` and adjust paths/keys as needed.
+
+### 1) Low-End Device / Smooth First
+
+```env
+ENABLE_MM_SCREEN_COMMENT=false
+ENABLE_SCAN_SUBPROCESS=true
+SCAN_REGION=200,120,1200,700
+SCAN_TICK_INTERVAL_SEC=10
+SCAN_SUBMIT_MIN_INTERVAL_SEC=15
+SCAN_BUSY_TIMEOUT_SEC=10
+SCREEN_SCAN_INTERVAL_SEC=60
+AUTO_COMMENT_COOLDOWN_SEC=80
+LIVE2D_FOLLOW_CURSOR=true
+LIVE2D_FOLLOW_ACTIVATE_DISTANCE_PX=180
+```
+
+### 2) Balanced Daily Use (Recommended)
+
+```env
+ENABLE_MULTIMODAL_VISION=true
+ENABLE_MM_COMPAT_MODE=true
+ENABLE_MM_SCREEN_COMMENT=true
+MM_TIMEOUT_SEC=5.0
+MM_FAILURE_THRESHOLD=3
+MM_COOLDOWN_SEC=120
+SCAN_TICK_INTERVAL_SEC=8
+SCAN_SUBMIT_MIN_INTERVAL_SEC=12
+SCREEN_SCAN_INTERVAL_SEC=45
+AUTO_COMMENT_COOLDOWN_SEC=60
+```
+
+### 3) Rich and Varied Auto Comments
+
+```env
+AUTO_COMMENT_STYLE_WEIGHTS=陪伴评论:0.9,轻松提问:1.3,俏皮打趣:1.3,温柔锐评:0.7,行动建议:1.1
+EMOTION_KEYWORDS_STRESSED=烦,崩溃,压力,焦虑,累,卡住,不会,好难,报错,失败,加班,熬夜,头疼
+EMOTION_KEYWORDS_POSITIVE=哈哈,开心,搞定,完成,顺利,不错,太好了,进步,通过,成功,耶
+EMOTION_KEYWORDS_FOCUSED=学习,复习,刷题,阅读,写代码,调试,文档,论文,专注,计划,总结
+SCREEN_COMMENT_MEMORY_LIMIT=4
+SCREEN_COMMENT_MEMORY_WEIGHT=0.25
+COMMENT_SIMILARITY_SKIP_THRESHOLD=0.84
+```
+
+### 4) Quiet Mode / Minimal Disturbance
+
+```env
+ENABLE_TTS=false
+ENABLE_AUTO_COMMENT_HEARTBEAT=false
+SCREEN_SCAN_INTERVAL_SEC=90
+AUTO_COMMENT_COOLDOWN_SEC=120
+AUTO_COMMENT_STYLE_WEIGHTS=陪伴评论:1.2,轻松提问:0.8,俏皮打趣:0.5,温柔锐评:0.4,行动建议:0.9
+```
+
+### Notes
+
+- `SCAN_REGION` is one of the highest-impact settings for smoothness.
+- If stutter appears, first increase `SCAN_SUBMIT_MIN_INTERVAL_SEC` and `SCREEN_SCAN_INTERVAL_SEC`.
+- For unstable vision APIs, keep `ENABLE_MM_COMPAT_MODE=true` to preserve OCR fallback.

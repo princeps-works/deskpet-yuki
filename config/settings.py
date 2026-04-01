@@ -65,6 +65,10 @@ class Settings:
     live2d_idle_group: str
     screen_comment_memory_limit: int
     screen_comment_memory_weight: float
+    auto_comment_style_weights: str
+    emotion_keywords_stressed: str
+    emotion_keywords_positive: str
+    emotion_keywords_focused: str
     comment_similarity_skip_threshold: float
     screen_scan_interval_sec: int
     auto_comment_cooldown_sec: int
@@ -261,6 +265,22 @@ def load_settings(base_dir: Path) -> Settings:
     screen_comment_memory_limit = max(0, screen_comment_memory_limit)
     screen_comment_memory_weight = float(os.getenv("SCREEN_COMMENT_MEMORY_WEIGHT", "0.2"))
     screen_comment_memory_weight = max(0.0, min(1.0, screen_comment_memory_weight))
+    auto_comment_style_weights = os.getenv(
+        "AUTO_COMMENT_STYLE_WEIGHTS",
+        "陪伴评论:1.0,轻松提问:1.2,俏皮打趣:1.0,温柔锐评:0.8,行动建议:1.0",
+    )
+    emotion_keywords_stressed = os.getenv(
+        "EMOTION_KEYWORDS_STRESSED",
+        "烦,崩溃,压力,焦虑,累,卡住,不会,好难,deadline,bug,报错,错误,失败,加班,熬夜,头疼,麻了",
+    )
+    emotion_keywords_positive = os.getenv(
+        "EMOTION_KEYWORDS_POSITIVE",
+        "哈哈,开心,搞定,完成,顺利,不错,太好了,舒服,进步,通过,成功,耶,轻松,满意",
+    )
+    emotion_keywords_focused = os.getenv(
+        "EMOTION_KEYWORDS_FOCUSED",
+        "学习,复习,写作业,刷题,阅读,写代码,调试,文档,论文,做题,专注,计划,总结,记笔记",
+    )
     comment_similarity_skip_threshold = float(os.getenv("COMMENT_SIMILARITY_SKIP_THRESHOLD", "0.86"))
     comment_similarity_skip_threshold = max(0.0, min(1.0, comment_similarity_skip_threshold))
     scan_interval = int(os.getenv("SCREEN_SCAN_INTERVAL_SEC", "45"))
@@ -322,6 +342,10 @@ def load_settings(base_dir: Path) -> Settings:
         live2d_idle_group=live2d_idle_group,
         screen_comment_memory_limit=screen_comment_memory_limit,
         screen_comment_memory_weight=screen_comment_memory_weight,
+        auto_comment_style_weights=auto_comment_style_weights,
+        emotion_keywords_stressed=emotion_keywords_stressed,
+        emotion_keywords_positive=emotion_keywords_positive,
+        emotion_keywords_focused=emotion_keywords_focused,
         comment_similarity_skip_threshold=comment_similarity_skip_threshold,
         screen_scan_interval_sec=scan_interval,
         auto_comment_cooldown_sec=cooldown,

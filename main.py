@@ -278,7 +278,14 @@ def main() -> int:
         memory_path=dialog_memory_path,
         tutor_enabled=settings.enable_tutor_persona,
     )
-    comment_engine = CommentEngine(llm_client, tutor_enabled=settings.enable_tutor_persona)
+    comment_engine = CommentEngine(
+        llm_client,
+        tutor_enabled=settings.enable_tutor_persona,
+        style_weights_text=settings.auto_comment_style_weights,
+        stressed_keywords_text=settings.emotion_keywords_stressed,
+        positive_keywords_text=settings.emotion_keywords_positive,
+        focused_keywords_text=settings.emotion_keywords_focused,
+    )
     speech = SpeechService(settings)
 
     def strip_bracketed_text(text: str) -> str:
@@ -1111,11 +1118,13 @@ def main() -> int:
                 return
 
             long_memory_hint = dialog.build_light_long_memory_hint(limit=settings.screen_comment_memory_limit)
+            recent_dialog_hint = dialog.build_recent_session_hint(limit=8)
             state["comment_future"] = comment_executor.submit(
                 comment_engine.comment_on_summary,
                 cycle_summary,
                 long_memory_hint,
                 settings.screen_comment_memory_weight,
+                recent_dialog_hint,
             )
             state["pending_comment_meta"] = {
                 "now": now,
@@ -1145,10 +1154,12 @@ def main() -> int:
                 return
 
             long_memory_hint = dialog.build_light_long_memory_hint(limit=settings.screen_comment_memory_limit)
+            recent_dialog_hint = dialog.build_recent_session_hint(limit=8)
             comment = comment_engine.comment_on_summary(
                 scene.summary,
                 long_memory_hint,
                 settings.screen_comment_memory_weight,
+                recent_dialog_hint,
             )
             _emit_comment(comment, role="桌宠(手动)")
         except Exception as exc:
