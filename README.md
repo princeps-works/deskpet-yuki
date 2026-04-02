@@ -1,55 +1,63 @@
 # Desktop Pet MVP Skeleton
 
-## Quick Start
+## Environment Setup
 
-1. Install dependencies:
+Recommended environment:
+
+- Windows 10/11
+- Python 3.10 to 3.12
+- Network access for LLM API and optional online TTS provider
+
+Setup steps:
+
+1. Install dependencies
+
    ```bash
    pip install -r requirements.txt
    ```
-2. Copy `.env.example` to `.env` and fill your API key.
-3. Run:
+
+2. Initialize config file
+
+   Copy .env.example to .env, then edit values.
+
+3. Fill minimum required config
+
+   - N1N_API_KEY
+   - N1N_BASE_URL
+   - MODEL_NAME
+
+4. Run app
+
    ```bash
    python main.py
    ```
 
 ## Config Overview
 
-All detailed parameter definitions, defaults, value ranges, and examples are centralized in:
+Full parameter definitions are in .env.example. This README keeps only setup-level guidance.
 
-- `.env.example`
+Key categories:
 
-`README` only keeps category-level guidance to stay clean.
+1. LLM and API
+- API key, base URL, text model, vision model.
 
-Adjustable env categories:
+2. Multimodal and OCR
+- Vision fallback, timeout/cooldown, OCR load controls.
 
-1. LLM / API
-- API keys, base URL, text model, vision model.
-
-2. Multimodal Scan Pipeline
-- Vision enable switches, compatibility fallback, timeout/failure/cooldown, image resize edge.
-
-3. Runtime Behavior
-- Heartbeat log switch, tutor persona startup switch.
+3. Runtime behavior
+- Heartbeat logs, tutor mode, chat debug display switches.
 
 4. TTS
-- Provider selection, voice/rate/volume, Azure settings, VOICEVOX settings.
+- edge, azure, voicevox provider configs.
 
-5. Live2D / Render
-- WebEngine mode, Live2D backend switches, model path, follow behavior, scale and idle group.
-- Includes runner diagnostics and motion-noise log filtering switches.
+5. Live2D and renderer
+- Model path, live2d-py mode, follow behavior, debug log switches.
 
-6. Scan Target and Scheduler
-- Monitor/region selection, scan tick interval, submit interval, busy timeout, subprocess mode.
+6. Scheduler and resource policy
+- Scan cadence, busy timeout, CPU policy tuning.
 
-7. Windows Resource Policy
-- OCR hard mode threshold, recovery grace, minimum policy reapply interval.
-
-8. Memory and Comment Policy
-- Memory recency/weight, long-memory injection, similarity skip threshold, scan/comment cadence.
-
-9. Auto Comment Style and Emotion Tuning
-- Style base weights and emotion keyword dictionaries.
-- Auto comments jointly consider: scan memory, recent dialog, and long-memory hints.
+7. Memory and auto comment
+- Memory weight, style weights, emotion keyword dictionaries.
 
 ## Multimodal Notes
 
@@ -66,18 +74,31 @@ Adjustable env categories:
 
 ## TTS Notes
 
-- `edge` is the easiest default provider.
-- Use Azure/VOICEVOX when you need specific voice quality or local engine control.
+- edge is the easiest default provider.
+- Use Azure or VOICEVOX when you need specific voice quality or local engine control.
 
 ## VOICEVOX Install
 
 - Install VOICEVOX app or engine into any local folder.
 - Ensure engine is running and listening on a local port (default `50021`).
-- Keep your project on any drive; only VOICEVOX main files need to be on G drive.
 - Set env:
   - `TTS_PROVIDER=voicevox`
   - `TTS_VOICEVOX_BASE_URL=http://127.0.0.1:50021`
   - `TTS_VOICEVOX_SPEAKER=1`
+   - `TTS_VOICEVOX_ENGINE_PATH=VOICEVOX/VOICEVOX/vv-engine/run.exe`
+
+Notes:
+
+- TTS_VOICEVOX_ENGINE_PATH supports both absolute path and project-relative path.
+- Project-relative path is resolved from the project root.
+- ENABLE_VOICEVOX_AUTO_LAUNCH=true allows auto-launch when API is unreachable.
+
+## Chat Display Switches
+
+- CHAT_SHOW_SYSTEM_MESSAGES=false:
+   hide role=系统 lines in chat window for immersion.
+- CHAT_SHOW_SESSION_DEBUG_MARKER=false:
+   show session markers like 桌宠(自动)[S2] only when debugging archive cycle behavior.
 
 ## Current Capabilities
 
