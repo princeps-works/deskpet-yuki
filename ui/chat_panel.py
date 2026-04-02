@@ -62,15 +62,24 @@ class DiaryWindow(QWidget):
 
 
 class ChatPanel(QWidget):
-    def __init__(self, dialog_manager: DialogManager, on_pet_reply: Optional[Callable[[str], None]] = None):
+    def __init__(
+        self,
+        dialog_manager: DialogManager,
+        on_pet_reply: Optional[Callable[[str], None]] = None,
+        on_archive_state_change: Optional[Callable[[bool, str], None]] = None,
+        show_system_messages: bool = False,
+    ):
         super().__init__()
         self.dialog_manager = dialog_manager
         self.on_pet_reply = on_pet_reply
+        self.on_archive_state_change = on_archive_state_change
+        self.show_system_messages = bool(show_system_messages)
         self.disable_auto_archive_on_close = False
         self.overlay_mode = False
         self._reply_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="chat-reply")
         self._pending_future: Future | None = None
         self._pending_task_type: str | None = None
+        self._archive_future: Future | None = None
         self._uploaded_image_path: str = ""
         self._uploaded_image_ocr_text: str = ""
         self.diary_window = DiaryWindow(None)
@@ -134,6 +143,10 @@ class ChatPanel(QWidget):
         self.reply_poll_timer = QTimer(self)
         self.reply_poll_timer.setInterval(100)
         self.reply_poll_timer.timeout.connect(self._poll_pending_reply)
+
+        self.archive_poll_timer = QTimer(self)
+        self.archive_poll_timer.setInterval(120)
+        self.archive_poll_timer.timeout.connect(self._poll_archive_task)
         self.input_line.installEventFilter(self)
 
     def enable_live2d_overlay_mode(self):
@@ -179,6 +192,8 @@ class ChatPanel(QWidget):
         self.move(desired_x, desired_y)
 
     def append_message(self, role: str, text: str):
+        if role.strip() == "系统" and (not self.show_system_messages):
+            return
         self.history.append(f"{role}: {text}")
 
     def on_send(self):
@@ -373,21 +388,59 @@ class ChatPanel(QWidget):
             self.append_message("系统", "已开启新聊天。")
 
     def on_end_chat(self):
-        summary = self.dialog_manager.end_current_chat()
+        self._start_async_archive_on_close()
+        self.hide()
+
+    def _start_async_archive_on_close(self):
+        if self.disable_auto_archive_on_close:
+            return
+        if self._archive_future is not None:
+            return
+
+        transcript = self.dialog_manager.pop_current_session_transcript()
+        if not transcript.strip():
+            return
+
+        if self.on_archive_state_change is not None:
+            self.on_archive_state_change(True, "妹妹写日记中，请不要关闭")
+
+        self._archive_future = self._reply_executor.submit(self.dialog_manager.archive_transcript, transcript)
+        self.archive_poll_timer.start()
+
+    def _poll_archive_task(self):
+        future = self._archive_future
+        if future is None:
+            self.archive_poll_timer.stop()
+            return
+        if not future.done():
+            return
+
+        self._archive_future = None
+        self.archive_poll_timer.stop()
+
+        try:
+            summary = str(future.result() or "").strip()
+            completion_hint = "日记写好啦"
+        except Exception:
+            summary = ""
+            completion_hint = "日记整理完成"
+
         if summary:
             self.append_message("系统", f"已归档本次聊天要点：{summary}")
         else:
             self.append_message("系统", "本次聊天无可归档内容。")
-        self.hide()
+
+        if self.on_archive_state_change is not None:
+            self.on_archive_state_change(False, completion_hint)
 
     def set_disable_auto_archive_on_close(self, disabled: bool):
         self.disable_auto_archive_on_close = disabled
 
     def closeEvent(self, event: QCloseEvent):
         self.reply_poll_timer.stop()
-        if not self.disable_auto_archive_on_close:
-            self.dialog_manager.end_current_chat()
-        event.accept()
+        self._start_async_archive_on_close()
+        self.hide()
+        event.ignore()
 
     def on_view_diary(self):
         entries = self.dialog_manager.list_long_memory(limit=10)

@@ -640,6 +640,10 @@ class DesktopPet(QWidget):
         self._update_bubble_pos()
         self._bubble_hide_timer.start(max(500, duration_ms))
 
+    def hide_comment_bubble(self):
+        self._bubble_hide_timer.stop()
+        self.bubble.hide()
+
     def set_auto_scan_enabled(self, enabled: bool):
         self.auto_scan_enabled = enabled
         if self.btn_toggle_scan is not None:

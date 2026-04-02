@@ -27,6 +27,8 @@ class Settings:
     mm_cooldown_sec: int
     mm_image_max_edge: int
     enable_auto_comment_heartbeat: bool
+    chat_show_system_messages: bool
+    chat_show_session_debug_marker: bool
     enable_tutor_persona: bool
     enable_tts: bool
     tts_provider: str
@@ -106,6 +108,18 @@ def _resolve_live2d_model_path(base_dir: Path, raw_value: str, default_path: Pat
     return str((base_dir / candidate).resolve())
 
 
+def _resolve_project_path(base_dir: Path, raw_value: str, default_path: Path) -> str:
+    text = (raw_value or "").strip()
+    if not text:
+        return str(default_path)
+
+    candidate = Path(text).expanduser()
+    if candidate.is_absolute():
+        return str(candidate)
+
+    return str((base_dir / candidate).resolve())
+
+
 def load_settings(base_dir: Path) -> Settings:
     env_path = base_dir / ".env"
     if not env_path.exists():
@@ -153,6 +167,18 @@ def load_settings(base_dir: Path) -> Settings:
         "yes",
         "on",
     }
+    chat_show_system_messages = os.getenv("CHAT_SHOW_SYSTEM_MESSAGES", "false").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    chat_show_session_debug_marker = os.getenv("CHAT_SHOW_SESSION_DEBUG_MARKER", "false").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
     enable_tutor_persona = os.getenv("ENABLE_TUTOR_PERSONA", "false").lower() in {
         "1",
         "true",
@@ -175,7 +201,11 @@ def load_settings(base_dir: Path) -> Settings:
     tts_voicevox_base_url = os.getenv("TTS_VOICEVOX_BASE_URL", "http://127.0.0.1:50021")
     tts_voicevox_speaker = int(os.getenv("TTS_VOICEVOX_SPEAKER", "1"))
     default_voicevox_engine_path = base_dir / "VOICEVOX" / "VOICEVOX" / "vv-engine" / "run.exe"
-    tts_voicevox_engine_path = os.getenv("TTS_VOICEVOX_ENGINE_PATH", str(default_voicevox_engine_path))
+    tts_voicevox_engine_path = _resolve_project_path(
+        base_dir,
+        os.getenv("TTS_VOICEVOX_ENGINE_PATH", ""),
+        default_voicevox_engine_path,
+    )
     enable_voicevox_auto_launch = os.getenv("ENABLE_VOICEVOX_AUTO_LAUNCH", "true").lower() in {
         "1",
         "true",
@@ -222,9 +252,12 @@ def load_settings(base_dir: Path) -> Settings:
     memory_recency_window_sec = max(0, memory_recency_window_sec)
     memory_min_weight = float(os.getenv("MEMORY_MIN_WEIGHT", "0.15"))
     memory_min_weight = max(0.0, min(1.0, memory_min_weight))
-    default_live2d_model = (
-        base_dir.parent.parent / "皮套" / "mao_pro_zh" / "runtime" / "mao_pro.model3.json"
-    )
+    default_live2d_model = base_dir / "皮套" / "mao_pro_zh" / "runtime" / "mao_pro.model3.json"
+    if not default_live2d_model.exists():
+        legacy_default_live2d_model = (
+            base_dir.parent.parent / "皮套" / "mao_pro_zh" / "runtime" / "mao_pro.model3.json"
+        )
+        default_live2d_model = legacy_default_live2d_model
     live2d_model_json = _resolve_live2d_model_path(
         base_dir,
         os.getenv("LIVE2D_MODEL_JSON", ""),
@@ -313,6 +346,8 @@ def load_settings(base_dir: Path) -> Settings:
         mm_cooldown_sec=mm_cooldown_sec,
         mm_image_max_edge=mm_image_max_edge,
         enable_auto_comment_heartbeat=enable_auto_comment_heartbeat,
+        chat_show_system_messages=chat_show_system_messages,
+        chat_show_session_debug_marker=chat_show_session_debug_marker,
         enable_tutor_persona=enable_tutor_persona,
         enable_tts=enable_tts,
         tts_provider=tts_provider,

@@ -69,9 +69,9 @@ Adjustable env categories:
 - `edge` is the easiest default provider.
 - Use Azure/VOICEVOX when you need specific voice quality or local engine control.
 
-## VOICEVOX Install on G Drive
+## VOICEVOX Install
 
-- Install VOICEVOX app or engine into a folder on G drive, for example `G:\VOICEVOX`.
+- Install VOICEVOX app or engine into any local folder.
 - Ensure engine is running and listening on a local port (default `50021`).
 - Keep your project on any drive; only VOICEVOX main files need to be on G drive.
 - Set env:

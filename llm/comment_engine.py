@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import random
+from datetime import datetime
 from typing import Dict, Tuple
 
 from desktop_pet.config.prompts import get_system_screen_comment_prompt
@@ -194,8 +195,10 @@ class CommentEngine:
         weight = max(0.0, min(1.0, memory_weight))
         emotion = self._infer_emotion_context(recent_dialog_hint, screen_summary)
         style_name, style_instruction = self._next_style(emotion)
+        now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         parts = [
             "你正在生成一条自动互动话术。",
+            f"当前时间: {now_text}",
             f"当前情绪上下文: {emotion}",
             f"本次风格: {style_name}",
             f"风格要求: {style_instruction}",

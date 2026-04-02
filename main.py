@@ -35,7 +35,7 @@ if __package__ is None or __package__ == "":
 
 from desktop_pet.config.settings import load_settings
 from desktop_pet.vision.ocr import warmup_ocr_engine
-from desktop_pet.config.prompts import OPENING_GREETING, SYSTEM_VOICEVOX_TRANSLATE_PROMPT
+from desktop_pet.config.prompts import SYSTEM_VOICEVOX_TRANSLATE_PROMPT
 
 
 def _merge_chromium_flags(existing: str, extras: list[str]) -> str:
@@ -473,8 +473,23 @@ def main() -> int:
     def speak_text(text: str) -> None:
         tts_executor.submit(_speak_async, text)
 
+    def on_archive_state_change(active: bool, message: str) -> None:
+        if active:
+            hint = message.strip() or "妹妹写日记中，请不要关闭"
+            pet.show_comment_bubble(hint, duration_ms=120000)
+        else:
+            pet.hide_comment_bubble()
+            done_hint = message.strip()
+            if done_hint:
+                pet.show_comment_bubble(done_hint, duration_ms=1800)
+
     pet = DesktopPet(settings=settings)
-    chat = ChatPanel(dialog_manager=dialog, on_pet_reply=speak_text)
+    chat = ChatPanel(
+        dialog_manager=dialog,
+        on_pet_reply=speak_text,
+        on_archive_state_change=on_archive_state_change,
+        show_system_messages=settings.chat_show_system_messages,
+    )
 
     if settings.enable_live2d_py:
         chat.enable_live2d_overlay_mode()
@@ -974,7 +989,11 @@ def main() -> int:
             chat.append_message("系统", "识别状态: 未识别到有效内容")
 
     def _emit_comment(comment: str, role: str = "桌宠(自动)") -> None:
-        show_and_speak(comment, role=role)
+        display_role = role
+        if settings.chat_show_session_debug_marker:
+            seg_id = max(1, int(dialog.get_current_session_segment_id()))
+            display_role = f"{role}[S{seg_id}]"
+        show_and_speak(comment, role=display_role)
         dialog.record_session_message(role, comment)
 
     def _append_cycle_memory(summary: str) -> None:
@@ -1928,7 +1947,6 @@ def main() -> int:
     chat.comment_btn.clicked.connect(do_manual_comment)
 
     def on_new_chat_requested() -> None:
-        chat.start_new_chat()
         if settings.enable_live2d_py:
             mx, my, mw, _mh = pet.get_live2d_py_target_geometry()
             target_x = max(20, int(mx - chat.width() - 14))
@@ -1956,7 +1974,7 @@ def main() -> int:
     pet.activateWindow()
 
     def emit_opening_greeting() -> None:
-        greeting = OPENING_GREETING.strip()
+        greeting = dialog.build_opening_greeting().strip()
         if not greeting:
             return
         show_and_speak(greeting, role="桌宠")
