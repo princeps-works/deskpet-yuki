@@ -14,7 +14,6 @@ except Exception:  # pragma: no cover
 
 @dataclass
 class Settings:
-    base_dir: Path
     api_key: str
     base_url: str
     model_name: str
@@ -26,9 +25,35 @@ class Settings:
     mm_failure_threshold: int
     mm_cooldown_sec: int
     mm_image_max_edge: int
+    mm_output_max_tokens: int
+    mm_auto_min_interval_sec: int
+    enable_ocr_first_routing: bool
+    ocr_only_min_chars: int
+    ocr_only_min_confidence: float
+    ocr_hybrid_min_chars: int
+    ocr_context_max_chars: int
     enable_auto_comment_heartbeat: bool
     chat_show_system_messages: bool
     chat_show_session_debug_marker: bool
+    enable_chat_multimodal: bool
+    chat_screen_context_max_chars: int
+    enable_visual_novel_mode: bool
+    visual_novel_min_context_similarity: float
+    enable_semantic_attention: bool
+    semantic_attention_model_path: str
+    semantic_attention_top_k: int
+    semantic_attention_min_score: float
+    semantic_attention_max_length: int
+    semantic_attention_cache_size: int
+    semantic_attention_cpu_threads: int
+    web_search_soft_deadline_sec: float
+    web_search_hard_deadline_sec: float
+    web_search_circuit_failure_threshold: int
+    web_search_circuit_cooldown_sec: int
+    web_search_max_results: int
+    web_search_context_max_chars: int
+    long_memory_limit: int
+    long_memory_context_window: int
     enable_tutor_persona: bool
     enable_tts: bool
     tts_provider: str
@@ -43,6 +68,16 @@ class Settings:
     tts_voicevox_engine_path: str
     enable_voicevox_auto_launch: bool
     enable_voicevox_ja_translation: bool
+    tts_translation_provider: str
+    tts_translation_model_id: str
+    tts_translation_model_path: str
+    tts_translation_device: str
+    tts_translation_compute_type: str
+    tts_translation_cache_path: str
+    tts_translation_cache_size: int
+    tts_translation_max_chars: int
+    enable_tts_translation_api_fallback: bool
+    tts_skip_on_translation_failure: bool
     webengine_gpu_mode: str
     enable_scan_subprocess: bool
     scan_monitor_index: int
@@ -53,14 +88,11 @@ class Settings:
     ocr_cpu_threads: int
     ocr_cpu_affinity_count: int
     ocr_max_edge: int
-    resource_policy_hard_after_sec: float
-    resource_policy_release_grace_sec: float
     resource_policy_reapply_min_sec: float
     memory_recency_window_sec: int
     memory_min_weight: float
     enable_live2d: bool
     enable_live2d_py: bool
-    enable_live2d_py_poc: bool
     live2d_py_window_width: int
     live2d_py_window_height: int
     live2d_model_json: str
@@ -75,6 +107,7 @@ class Settings:
     emotion_keywords_positive: str
     emotion_keywords_focused: str
     comment_similarity_skip_threshold: float
+    enable_comment_api_understanding: bool
     screen_scan_interval_sec: int
     auto_comment_cooldown_sec: int
     pet_image_path: Path
@@ -134,7 +167,7 @@ def load_settings(base_dir: Path) -> Settings:
     )
     base_url = os.getenv("N1N_BASE_URL", "https://api.n1n.ai/v1")
     model_name = os.getenv("MODEL_NAME", "gpt-4o")
-    vision_model_name = os.getenv("VISION_MODEL_NAME", model_name)
+    vision_model_name = os.getenv("VISION_MODEL_NAME", "").strip() or model_name
     enable_multimodal_vision = os.getenv("ENABLE_MULTIMODAL_VISION", "true").lower() in {
         "1",
         "true",
@@ -161,6 +194,24 @@ def load_settings(base_dir: Path) -> Settings:
     mm_cooldown_sec = max(10, min(3600, mm_cooldown_sec))
     mm_image_max_edge = int(os.getenv("MM_IMAGE_MAX_EDGE", "1280"))
     mm_image_max_edge = max(320, min(2048, mm_image_max_edge))
+    mm_output_max_tokens = int(os.getenv("MM_OUTPUT_MAX_TOKENS", "220"))
+    mm_output_max_tokens = max(64, min(1024, mm_output_max_tokens))
+    mm_auto_min_interval_sec = int(os.getenv("MM_AUTO_MIN_INTERVAL_SEC", "300"))
+    mm_auto_min_interval_sec = max(0, min(3600, mm_auto_min_interval_sec))
+    enable_ocr_first_routing = os.getenv("ENABLE_OCR_FIRST_ROUTING", "true").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    ocr_only_min_chars = int(os.getenv("OCR_ONLY_MIN_CHARS", "120"))
+    ocr_only_min_chars = max(1, min(10000, ocr_only_min_chars))
+    ocr_only_min_confidence = float(os.getenv("OCR_ONLY_MIN_CONFIDENCE", "0.75"))
+    ocr_only_min_confidence = max(0.0, min(1.0, ocr_only_min_confidence))
+    ocr_hybrid_min_chars = int(os.getenv("OCR_HYBRID_MIN_CHARS", "30"))
+    ocr_hybrid_min_chars = max(1, min(ocr_only_min_chars, ocr_hybrid_min_chars))
+    ocr_context_max_chars = int(os.getenv("OCR_CONTEXT_MAX_CHARS", "1200"))
+    ocr_context_max_chars = max(200, min(6000, ocr_context_max_chars))
     enable_auto_comment_heartbeat = os.getenv("ENABLE_AUTO_COMMENT_HEARTBEAT", "true").lower() in {
         "1",
         "true",
@@ -179,6 +230,65 @@ def load_settings(base_dir: Path) -> Settings:
         "yes",
         "on",
     }
+    enable_chat_multimodal = os.getenv("ENABLE_CHAT_MULTIMODAL", "false").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    chat_screen_context_max_chars = int(os.getenv("CHAT_SCREEN_CONTEXT_MAX_CHARS", "1600"))
+    chat_screen_context_max_chars = max(200, min(6000, chat_screen_context_max_chars))
+    enable_visual_novel_mode = os.getenv("ENABLE_VISUAL_NOVEL_MODE", "false").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    visual_novel_min_context_similarity = float(
+        os.getenv("VN_MIN_CONTEXT_SIMILARITY", "0.30")
+    )
+    visual_novel_min_context_similarity = max(0.0, min(1.0, visual_novel_min_context_similarity))
+    enable_semantic_attention = os.getenv("ENABLE_SEMANTIC_ATTENTION", "true").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    default_semantic_attention_model_path = base_dir / "assets" / "models" / "bge-small-zh-v1.5-onnx"
+    semantic_attention_model_path = _resolve_project_path(
+        base_dir,
+        os.getenv("SEMANTIC_ATTENTION_MODEL_PATH", ""),
+        default_semantic_attention_model_path,
+    )
+    semantic_attention_top_k = int(os.getenv("SEMANTIC_ATTENTION_TOP_K", "8"))
+    semantic_attention_top_k = max(2, min(32, semantic_attention_top_k))
+    semantic_attention_min_score = float(os.getenv("SEMANTIC_ATTENTION_MIN_SCORE", "0.34"))
+    semantic_attention_min_score = max(0.0, min(1.0, semantic_attention_min_score))
+    semantic_attention_max_length = int(os.getenv("SEMANTIC_ATTENTION_MAX_LENGTH", "256"))
+    semantic_attention_max_length = max(32, min(512, semantic_attention_max_length))
+    semantic_attention_cache_size = int(os.getenv("SEMANTIC_ATTENTION_CACHE_SIZE", "512"))
+    semantic_attention_cache_size = max(0, min(10000, semantic_attention_cache_size))
+    semantic_attention_cpu_threads = int(os.getenv("SEMANTIC_ATTENTION_CPU_THREADS", "2"))
+    semantic_attention_cpu_threads = max(1, min(16, semantic_attention_cpu_threads))
+    web_search_soft_deadline_sec = float(os.getenv("WEB_SEARCH_SOFT_DEADLINE_SEC", "3.0"))
+    web_search_soft_deadline_sec = max(0.5, min(10.0, web_search_soft_deadline_sec))
+    web_search_hard_deadline_sec = float(os.getenv("WEB_SEARCH_HARD_DEADLINE_SEC", "8.0"))
+    web_search_hard_deadline_sec = max(
+        web_search_soft_deadline_sec,
+        min(30.0, web_search_hard_deadline_sec),
+    )
+    web_search_circuit_failure_threshold = int(os.getenv("WEB_SEARCH_CIRCUIT_FAILURE_THRESHOLD", "3"))
+    web_search_circuit_failure_threshold = max(1, min(10, web_search_circuit_failure_threshold))
+    web_search_circuit_cooldown_sec = int(os.getenv("WEB_SEARCH_CIRCUIT_COOLDOWN_SEC", "600"))
+    web_search_circuit_cooldown_sec = max(10, min(3600, web_search_circuit_cooldown_sec))
+    web_search_max_results = int(os.getenv("WEB_SEARCH_MAX_RESULTS", "5"))
+    web_search_max_results = max(1, min(5, web_search_max_results))
+    web_search_context_max_chars = int(os.getenv("WEB_SEARCH_CONTEXT_MAX_CHARS", "900"))
+    web_search_context_max_chars = max(300, min(3000, web_search_context_max_chars))
+    long_memory_limit = int(os.getenv("LONG_MEMORY_LIMIT", "360"))
+    long_memory_limit = max(20, min(2000, long_memory_limit))
+    long_memory_context_window = int(os.getenv("LONG_MEMORY_CONTEXT_WINDOW", "30"))
+    long_memory_context_window = max(1, min(long_memory_limit, long_memory_context_window))
     enable_tutor_persona = os.getenv("ENABLE_TUTOR_PERSONA", "false").lower() in {
         "1",
         "true",
@@ -218,6 +328,58 @@ def load_settings(base_dir: Path) -> Settings:
         "yes",
         "on",
     }
+    tts_translation_provider = os.getenv("TTS_TRANSLATION_PROVIDER", "local").strip().lower()
+    if tts_translation_provider not in {"local", "api", "none"}:
+        tts_translation_provider = "local"
+    tts_translation_model_id = os.getenv(
+        "TTS_TRANSLATION_MODEL_ID",
+        "facebook/m2m100_418M",
+    ).strip() or "facebook/m2m100_418M"
+    default_translation_model_path = base_dir / "assets" / "models" / "m2m100_418M_ct2"
+    tts_translation_model_path = _resolve_project_path(
+        base_dir,
+        os.getenv("TTS_TRANSLATION_MODEL_PATH", ""),
+        default_translation_model_path,
+    )
+    tts_translation_device = os.getenv("TTS_TRANSLATION_DEVICE", "cuda").strip().lower()
+    if tts_translation_device not in {"auto", "cpu", "cuda"}:
+        tts_translation_device = "auto"
+    tts_translation_compute_type = os.getenv(
+        "TTS_TRANSLATION_COMPUTE_TYPE",
+        "int8_float16",
+    ).strip().lower()
+    allowed_translation_compute_types = {
+        "auto",
+        "default",
+        "int8",
+        "int8_float32",
+        "int8_float16",
+        "int8_bfloat16",
+        "int16",
+        "float16",
+        "bfloat16",
+        "float32",
+    }
+    if tts_translation_compute_type not in allowed_translation_compute_types:
+        tts_translation_compute_type = "auto"
+    default_translation_cache_path = base_dir / "data" / "tts_translation_cache.json"
+    tts_translation_cache_path = _resolve_project_path(
+        base_dir,
+        os.getenv("TTS_TRANSLATION_CACHE_PATH", ""),
+        default_translation_cache_path,
+    )
+    tts_translation_cache_size = int(os.getenv("TTS_TRANSLATION_CACHE_SIZE", "2000"))
+    tts_translation_cache_size = max(0, min(20000, tts_translation_cache_size))
+    tts_translation_max_chars = int(os.getenv("TTS_TRANSLATION_MAX_CHARS", "220"))
+    tts_translation_max_chars = max(40, min(1000, tts_translation_max_chars))
+    enable_tts_translation_api_fallback = os.getenv(
+        "ENABLE_TTS_TRANSLATION_API_FALLBACK",
+        "false",
+    ).lower() in {"1", "true", "yes", "on"}
+    tts_skip_on_translation_failure = os.getenv(
+        "TTS_SKIP_ON_TRANSLATION_FAILURE",
+        "true",
+    ).lower() in {"1", "true", "yes", "on"}
     webengine_gpu_mode = os.getenv("WEBENGINE_GPU_MODE", "gpu").strip().lower()
     if webengine_gpu_mode not in {"gpu", "software", "auto"}:
         webengine_gpu_mode = "gpu"
@@ -227,8 +389,9 @@ def load_settings(base_dir: Path) -> Settings:
         "yes",
         "on",
     }
-    scan_monitor_index = int(os.getenv("SCAN_MONITOR_INDEX", "1"))
-    scan_monitor_index = max(1, scan_monitor_index)
+    # 0 means the complete virtual desktop; positive values select an MSS display.
+    scan_monitor_index = int(os.getenv("SCAN_MONITOR_INDEX", "0"))
+    scan_monitor_index = max(0, scan_monitor_index)
     scan_region = _parse_scan_region(os.getenv("SCAN_REGION", ""))
     scan_tick_interval_sec = int(os.getenv("SCAN_TICK_INTERVAL_SEC", "0"))
     scan_tick_interval_sec = max(0, scan_tick_interval_sec)
@@ -242,10 +405,6 @@ def load_settings(base_dir: Path) -> Settings:
     ocr_cpu_affinity_count = max(0, min(64, ocr_cpu_affinity_count))
     ocr_max_edge = int(os.getenv("OCR_MAX_EDGE", "0"))
     ocr_max_edge = max(0, min(4096, ocr_max_edge))
-    resource_policy_hard_after_sec = float(os.getenv("RESOURCE_POLICY_HARD_AFTER_SEC", "2.5"))
-    resource_policy_hard_after_sec = max(0.5, min(30.0, resource_policy_hard_after_sec))
-    resource_policy_release_grace_sec = float(os.getenv("RESOURCE_POLICY_RELEASE_GRACE_SEC", "1.2"))
-    resource_policy_release_grace_sec = max(0.0, min(10.0, resource_policy_release_grace_sec))
     resource_policy_reapply_min_sec = float(os.getenv("RESOURCE_POLICY_REAPPLY_MIN_SEC", "4.0"))
     resource_policy_reapply_min_sec = max(0.2, min(20.0, resource_policy_reapply_min_sec))
     memory_recency_window_sec = int(os.getenv("MEMORY_RECENCY_WINDOW_SEC", "0"))
@@ -275,19 +434,9 @@ def load_settings(base_dir: Path) -> Settings:
         "yes",
         "on",
     }
-    enable_live2d_py_poc = os.getenv("ENABLE_LIVE2D_PY_POC", "false").lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-    # Backward compatibility for previous PoC flag name.
-    if enable_live2d_py_poc:
-        enable_live2d_py = True
     # Treat ENABLE_LIVE2D as a global master switch for all Live2D backends.
     if not enable_live2d:
         enable_live2d_py = False
-        enable_live2d_py_poc = False
     live2d_py_window_width = int(os.getenv("LIVE2D_PY_WINDOW_WIDTH", "280"))
     live2d_py_window_width = max(180, live2d_py_window_width)
     live2d_py_window_height = int(os.getenv("LIVE2D_PY_WINDOW_HEIGHT", "430"))
@@ -325,6 +474,12 @@ def load_settings(base_dir: Path) -> Settings:
     )
     comment_similarity_skip_threshold = float(os.getenv("COMMENT_SIMILARITY_SKIP_THRESHOLD", "0.86"))
     comment_similarity_skip_threshold = max(0.0, min(1.0, comment_similarity_skip_threshold))
+    enable_comment_api_understanding = os.getenv("ENABLE_COMMENT_API_UNDERSTANDING", "false").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
     scan_interval = int(os.getenv("SCREEN_SCAN_INTERVAL_SEC", "45"))
     cooldown = int(os.getenv("AUTO_COMMENT_COOLDOWN_SEC", "60"))
 
@@ -333,7 +488,6 @@ def load_settings(base_dir: Path) -> Settings:
     pet_image_path = candidate_1 if candidate_1.exists() else candidate_2
 
     return Settings(
-        base_dir=base_dir,
         api_key=api_key,
         base_url=base_url,
         model_name=model_name,
@@ -345,9 +499,35 @@ def load_settings(base_dir: Path) -> Settings:
         mm_failure_threshold=mm_failure_threshold,
         mm_cooldown_sec=mm_cooldown_sec,
         mm_image_max_edge=mm_image_max_edge,
+        mm_output_max_tokens=mm_output_max_tokens,
+        mm_auto_min_interval_sec=mm_auto_min_interval_sec,
+        enable_ocr_first_routing=enable_ocr_first_routing,
+        ocr_only_min_chars=ocr_only_min_chars,
+        ocr_only_min_confidence=ocr_only_min_confidence,
+        ocr_hybrid_min_chars=ocr_hybrid_min_chars,
+        ocr_context_max_chars=ocr_context_max_chars,
         enable_auto_comment_heartbeat=enable_auto_comment_heartbeat,
         chat_show_system_messages=chat_show_system_messages,
         chat_show_session_debug_marker=chat_show_session_debug_marker,
+        enable_chat_multimodal=enable_chat_multimodal,
+        chat_screen_context_max_chars=chat_screen_context_max_chars,
+        enable_visual_novel_mode=enable_visual_novel_mode,
+        visual_novel_min_context_similarity=visual_novel_min_context_similarity,
+        enable_semantic_attention=enable_semantic_attention,
+        semantic_attention_model_path=semantic_attention_model_path,
+        semantic_attention_top_k=semantic_attention_top_k,
+        semantic_attention_min_score=semantic_attention_min_score,
+        semantic_attention_max_length=semantic_attention_max_length,
+        semantic_attention_cache_size=semantic_attention_cache_size,
+        semantic_attention_cpu_threads=semantic_attention_cpu_threads,
+        web_search_soft_deadline_sec=web_search_soft_deadline_sec,
+        web_search_hard_deadline_sec=web_search_hard_deadline_sec,
+        web_search_circuit_failure_threshold=web_search_circuit_failure_threshold,
+        web_search_circuit_cooldown_sec=web_search_circuit_cooldown_sec,
+        web_search_max_results=web_search_max_results,
+        web_search_context_max_chars=web_search_context_max_chars,
+        long_memory_limit=long_memory_limit,
+        long_memory_context_window=long_memory_context_window,
         enable_tutor_persona=enable_tutor_persona,
         enable_tts=enable_tts,
         tts_provider=tts_provider,
@@ -362,6 +542,16 @@ def load_settings(base_dir: Path) -> Settings:
         tts_voicevox_engine_path=tts_voicevox_engine_path,
         enable_voicevox_auto_launch=enable_voicevox_auto_launch,
         enable_voicevox_ja_translation=enable_voicevox_ja_translation,
+        tts_translation_provider=tts_translation_provider,
+        tts_translation_model_id=tts_translation_model_id,
+        tts_translation_model_path=tts_translation_model_path,
+        tts_translation_device=tts_translation_device,
+        tts_translation_compute_type=tts_translation_compute_type,
+        tts_translation_cache_path=tts_translation_cache_path,
+        tts_translation_cache_size=tts_translation_cache_size,
+        tts_translation_max_chars=tts_translation_max_chars,
+        enable_tts_translation_api_fallback=enable_tts_translation_api_fallback,
+        tts_skip_on_translation_failure=tts_skip_on_translation_failure,
         webengine_gpu_mode=webengine_gpu_mode,
         enable_scan_subprocess=enable_scan_subprocess,
         scan_monitor_index=scan_monitor_index,
@@ -372,14 +562,11 @@ def load_settings(base_dir: Path) -> Settings:
         ocr_cpu_threads=ocr_cpu_threads,
         ocr_cpu_affinity_count=ocr_cpu_affinity_count,
         ocr_max_edge=ocr_max_edge,
-        resource_policy_hard_after_sec=resource_policy_hard_after_sec,
-        resource_policy_release_grace_sec=resource_policy_release_grace_sec,
         resource_policy_reapply_min_sec=resource_policy_reapply_min_sec,
         memory_recency_window_sec=memory_recency_window_sec,
         memory_min_weight=memory_min_weight,
         enable_live2d=enable_live2d,
         enable_live2d_py=enable_live2d_py,
-        enable_live2d_py_poc=enable_live2d_py_poc,
         live2d_py_window_width=live2d_py_window_width,
         live2d_py_window_height=live2d_py_window_height,
         live2d_model_json=live2d_model_json,
@@ -394,6 +581,7 @@ def load_settings(base_dir: Path) -> Settings:
         emotion_keywords_positive=emotion_keywords_positive,
         emotion_keywords_focused=emotion_keywords_focused,
         comment_similarity_skip_threshold=comment_similarity_skip_threshold,
+        enable_comment_api_understanding=enable_comment_api_understanding,
         screen_scan_interval_sec=scan_interval,
         auto_comment_cooldown_sec=cooldown,
         pet_image_path=pet_image_path,

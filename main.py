@@ -20,11 +20,31 @@ from pathlib import Path
 
 
 _SUBPROC_SCAN_CACHE: dict[str, object] = {
+    "scan_target": None,
     "fingerprint": None,
+    "ocr_hash": "",
+    "ocr_text": "",
+    "ocr_confidence": 0.0,
     "screen_context": "",
     "scene_summary": "",
     "scene_should_comment": False,
     "mode": "none",
+    "mm_reason": "off",
+    "mm_elapsed_ms": 0,
+    "mm_summary_len": 0,
+    "vision_route": "none",
+}
+
+_SUBPROC_MM_RUNTIME: dict[str, object] = {
+    "inited": False,
+    "enabled": False,
+    "client": None,
+    "settings": None,
+    "timeout_sec": 5.0,
+    "max_edge": 1280,
+    "mm_fail_streak": 0,
+    "mm_cooldown_until": None,
+    "mm_last_request_at": None,
 }
 
 # 兼容两种启动方式：
@@ -80,9 +100,10 @@ def configure_webengine_render_mode(mode: str) -> None:
     print("[STARTUP] WebEngine render mode: gpu")
 
 
-def _frame_fingerprint(image) -> bytes:
+def _frame_fingerprint(image, *, text_sensitive: bool = False) -> bytes:
     # Downsample grayscale bytes as a lightweight scene fingerprint.
-    gray = image.convert("L").resize((32, 18))
+    size = (96, 36) if text_sensitive else (32, 18)
+    gray = image.convert("L").resize(size)
     return gray.tobytes()
 
 
@@ -107,12 +128,227 @@ def _resize_for_ocr(image, max_edge: int):
     return image.resize((new_w, new_h))
 
 
+def _crop_visual_novel_scan_image(image, *, enabled: bool, has_manual_region: bool):
+    if not enabled or has_manual_region:
+        return image
+    width, height = image.size
+    top = max(0, min(height - 1, int(round(height * 0.58))))
+    return image.crop((0, top, width, height))
+
+
+def _compose_screen_context(vision_summary: str, ocr_text: str) -> tuple[str, str]:
+    """Keep source-specific prefix while routing into one downstream processing path."""
+    vision_clean = " ".join(str(vision_summary or "").split())
+    ocr_clean = " ".join(str(ocr_text or "").split())
+
+    if not vision_clean and not ocr_clean:
+        return "", "none"
+
+    parts: list[str] = []
+    if ocr_clean and vision_clean:
+        mode = "vision+ocr"
+        parts.append(f"视觉摘要: {vision_clean}")
+        parts.append(f"OCR文本: {ocr_clean}")
+    elif ocr_clean:
+        mode = "ocr"
+        parts.append(f"OCR文本: {ocr_clean}")
+    else:
+        mode = "vision"
+        parts.append(f"视觉摘要: {vision_clean}")
+    return "\n".join(parts).strip(), mode
+
+
+def _request_multimodal_summary(
+    llm_client,
+    image,
+    settings_obj,
+    runtime_state: dict,
+    log_fn=None,
+    *,
+    ocr_context: str = "",
+    route: str = "vision_only",
+    respect_min_interval: bool = True,
+    vision_enabled: bool | None = None,
+    focus_query: str = "",
+) -> tuple[str, str, int, int]:
+    feature_enabled = (
+        bool(getattr(settings_obj, "enable_mm_screen_comment", False))
+        if vision_enabled is None
+        else bool(vision_enabled)
+    )
+    mm_enabled = bool(getattr(settings_obj, "enable_multimodal_vision", False) and feature_enabled)
+    if (not mm_enabled) or llm_client is None:
+        return "", "off", 0, 0
+
+    def _log(stage: str, detail: str) -> None:
+        if callable(log_fn):
+            try:
+                log_fn(stage, detail)
+            except Exception:
+                pass
+
+    def _mark_success() -> None:
+        runtime_state["mm_fail_streak"] = 0
+        runtime_state["mm_cooldown_until"] = None
+
+    def _mark_failure(reason: str) -> None:
+        streak = int(runtime_state.get("mm_fail_streak", 0)) + 1
+        runtime_state["mm_fail_streak"] = streak
+        threshold = max(1, int(getattr(settings_obj, "mm_failure_threshold", 1)))
+        if streak >= threshold:
+            cooldown_sec = max(10, int(getattr(settings_obj, "mm_cooldown_sec", 30)))
+            runtime_state["mm_cooldown_until"] = datetime.now() + timedelta(seconds=cooldown_sec)
+            _log("mm_cooldown", f"reason={reason}, streak={streak}, cooldown={cooldown_sec}s")
+        else:
+            _log("mm_fail", f"reason={reason}, streak={streak}/{threshold}")
+
+    cooldown_until = runtime_state.get("mm_cooldown_until")
+    now = datetime.now()
+    if isinstance(cooldown_until, datetime) and now < cooldown_until:
+        remain = int((cooldown_until - now).total_seconds())
+        _log("mm_skip", f"cooldown_remain={max(1, remain)}s")
+        return "", "cooldown", 0, 0
+
+    if respect_min_interval:
+        min_interval_sec = max(0, int(getattr(settings_obj, "mm_auto_min_interval_sec", 0)))
+        last_request_at = runtime_state.get("mm_last_request_at")
+        if min_interval_sec > 0 and isinstance(last_request_at, datetime):
+            elapsed_sec = (now - last_request_at).total_seconds()
+            if elapsed_sec < min_interval_sec:
+                remain = int(round(min_interval_sec - elapsed_sec))
+                _log("mm_skip", f"rate_limit_remain={max(1, remain)}s")
+                return "", "rate_limited", 0, 0
+
+    runtime_state["mm_last_request_at"] = now
+
+    try:
+        if bool(getattr(settings_obj, "enable_mm_compat_mode", True)):
+            from desktop_pet.vision.multimodal import describe_screen_image_compat
+
+            vision_result = describe_screen_image_compat(
+                llm_client,
+                image,
+                timeout_sec=float(getattr(settings_obj, "mm_timeout_sec", 5.0)),
+                max_edge=int(getattr(settings_obj, "mm_image_max_edge", 1280)),
+                ocr_context=ocr_context,
+                route=route,
+                focus_query=focus_query,
+            )
+            summary = str(vision_result.summary or "").strip()
+            reason = str(vision_result.reason)
+            elapsed_ms = int(vision_result.elapsed_ms)
+        else:
+            from desktop_pet.vision.multimodal import describe_screen_image
+
+            visual_summary = describe_screen_image(
+                llm_client,
+                image,
+                ocr_context=ocr_context,
+                route=route,
+                focus_query=focus_query,
+            )
+            summary = str(visual_summary or "").strip()
+            reason = "ok" if summary else "empty"
+            elapsed_ms = 0
+    except Exception:
+        _mark_failure("error")
+        _log("mm_result", "reason=error, elapsed_ms=0, len=0")
+        return "", "error", 0, 0
+
+    summary_len = len(summary)
+    _log("mm_result", f"reason={reason}, elapsed_ms={elapsed_ms}, len={summary_len}")
+    if summary:
+        _mark_success()
+        return summary, reason, elapsed_ms, summary_len
+
+    _mark_failure(reason)
+    return "", reason, elapsed_ms, 0
+
+
+def _build_ocr_first_context(
+    llm_client,
+    image,
+    ocr_result,
+    settings_obj,
+    runtime_state: dict,
+    log_fn=None,
+    *,
+    respect_vision_interval: bool,
+    vision_enabled: bool | None = None,
+    focus_query: str = "",
+) -> dict:
+    from desktop_pet.vision.router import VisionRouteDecision, decide_vision_route
+
+    ocr_text = str(getattr(ocr_result, "text", "") or "").strip()
+    if bool(getattr(settings_obj, "enable_ocr_first_routing", True)):
+        decision = decide_vision_route(
+            ocr_result,
+            ocr_only_min_chars=int(getattr(settings_obj, "ocr_only_min_chars", 120)),
+            ocr_only_min_confidence=float(getattr(settings_obj, "ocr_only_min_confidence", 0.75)),
+            hybrid_min_chars=int(getattr(settings_obj, "ocr_hybrid_min_chars", 30)),
+        )
+    else:
+        decision = VisionRouteDecision("vision_only", "ocr_first_disabled")
+
+    if callable(log_fn):
+        try:
+            log_fn(
+                "vision_route",
+                (
+                    f"route={decision.route}, reason={decision.reason}, "
+                    f"ocr_chars={int(getattr(ocr_result, 'char_count', 0))}, "
+                    f"ocr_conf={float(getattr(ocr_result, 'average_confidence', 0.0)):.2f}"
+                ),
+            )
+        except Exception:
+            pass
+
+    vision_summary = ""
+    mm_reason = "ocr_only"
+    mm_elapsed_ms = 0
+    mm_summary_len = 0
+    if decision.route != "ocr_only":
+        ocr_context = ""
+        if decision.route == "vision+ocr":
+            ocr_context = ocr_result.to_prompt_text(
+                max_chars=int(getattr(settings_obj, "ocr_context_max_chars", 1200))
+            )
+        vision_summary, mm_reason, mm_elapsed_ms, mm_summary_len = _request_multimodal_summary(
+            llm_client,
+            image,
+            settings_obj,
+            runtime_state,
+            log_fn,
+            ocr_context=ocr_context,
+            route=decision.route,
+            respect_min_interval=respect_vision_interval,
+            vision_enabled=vision_enabled,
+            focus_query=focus_query,
+        )
+
+    screen_context, mode = _compose_screen_context(vision_summary, ocr_text)
+    return {
+        "screen_context": screen_context,
+        "mode": mode,
+        "vision_route": decision.route,
+        "vision_route_reason": decision.reason,
+        "mm_reason": mm_reason,
+        "mm_elapsed_ms": mm_elapsed_ms,
+        "mm_summary_len": mm_summary_len,
+        "ocr_hash": str(getattr(ocr_result, "text_hash", "") or ""),
+        "ocr_text": ocr_text,
+        "ocr_chars": int(getattr(ocr_result, "char_count", 0)),
+        "ocr_confidence": float(getattr(ocr_result, "average_confidence", 0.0)),
+    }
+
+
 def run_scan_pipeline_subprocess(
     scan_monitor_index: int,
     scan_region: tuple[int, int, int, int] | None,
     ocr_cpu_threads: int = 0,
     ocr_cpu_affinity_count: int = 0,
     ocr_max_edge: int = 0,
+    visual_novel_mode: bool = False,
 ) -> dict:
     try:
         import psutil
@@ -135,45 +371,152 @@ def run_scan_pipeline_subprocess(
         os.environ["ORT_NUM_THREADS"] = thread_value
 
     from desktop_pet.vision.capture import capture_primary_screen
-    from desktop_pet.vision.ocr import extract_text, get_ocr_runtime_status
+    from desktop_pet.vision.ocr import extract_ocr_result, get_ocr_runtime_status
     from desktop_pet.vision.scene_analyzer import analyze_scene
+    from desktop_pet.llm.client import LLMClient
+
+    if not bool(_SUBPROC_MM_RUNTIME.get("inited", False)):
+        try:
+            subproc_settings = load_settings(Path(__file__).resolve().parent)
+            mm_enabled = bool(subproc_settings.enable_multimodal_vision and subproc_settings.enable_mm_screen_comment)
+            _SUBPROC_MM_RUNTIME["enabled"] = mm_enabled
+            _SUBPROC_MM_RUNTIME["timeout_sec"] = float(subproc_settings.mm_timeout_sec)
+            _SUBPROC_MM_RUNTIME["max_edge"] = int(subproc_settings.mm_image_max_edge)
+            _SUBPROC_MM_RUNTIME["client"] = LLMClient(subproc_settings) if mm_enabled else None
+            _SUBPROC_MM_RUNTIME["settings"] = subproc_settings
+        except Exception:
+            _SUBPROC_MM_RUNTIME["enabled"] = False
+            _SUBPROC_MM_RUNTIME["client"] = None
+            _SUBPROC_MM_RUNTIME["settings"] = None
+        finally:
+            _SUBPROC_MM_RUNTIME["inited"] = True
 
     image = capture_primary_screen(monitor_index=scan_monitor_index, region=scan_region)
-    fingerprint = _frame_fingerprint(image)
+    image = _crop_visual_novel_scan_image(
+        image,
+        enabled=bool(visual_novel_mode),
+        has_manual_region=scan_region is not None,
+    )
+    scan_target = (
+        int(scan_monitor_index),
+        tuple(scan_region) if scan_region is not None else None,
+        bool(visual_novel_mode),
+    )
+    if _SUBPROC_SCAN_CACHE.get("scan_target") != scan_target:
+        _SUBPROC_SCAN_CACHE["scan_target"] = scan_target
+        _SUBPROC_SCAN_CACHE["fingerprint"] = None
+        _SUBPROC_SCAN_CACHE["ocr_hash"] = ""
+        _SUBPROC_SCAN_CACHE["ocr_text"] = ""
+        _SUBPROC_SCAN_CACHE["ocr_confidence"] = 0.0
+        _SUBPROC_SCAN_CACHE["screen_context"] = ""
+        _SUBPROC_SCAN_CACHE["scene_summary"] = ""
+        _SUBPROC_SCAN_CACHE["vision_route"] = "none"
+    fingerprint = _frame_fingerprint(image, text_sensitive=bool(visual_novel_mode))
     prev_fingerprint = _SUBPROC_SCAN_CACHE.get("fingerprint")
     if isinstance(prev_fingerprint, bytes):
         diff_ratio = _fingerprint_diff_ratio(fingerprint, prev_fingerprint)
-        if diff_ratio < 0.04 and str(_SUBPROC_SCAN_CACHE.get("scene_summary", "")).strip():
+        diff_threshold = 0.012 if visual_novel_mode else 0.04
+        if diff_ratio < diff_threshold and str(_SUBPROC_SCAN_CACHE.get("scene_summary", "")).strip():
             return {
                 "ocr_ok": True,
                 "ocr_info": "cache_reuse",
                 "mode": str(_SUBPROC_SCAN_CACHE.get("mode", "none")),
                 "screen_context": str(_SUBPROC_SCAN_CACHE.get("screen_context", "")),
+                "ocr_text": str(_SUBPROC_SCAN_CACHE.get("ocr_text", "")),
+                "ocr_confidence": float(_SUBPROC_SCAN_CACHE.get("ocr_confidence", 0.0) or 0.0),
                 "scene_summary": str(_SUBPROC_SCAN_CACHE.get("scene_summary", "")),
                 "scene_should_comment": bool(_SUBPROC_SCAN_CACHE.get("scene_should_comment", False)),
+                "mm_reason": str(_SUBPROC_SCAN_CACHE.get("mm_reason", "off")),
+                "mm_elapsed_ms": int(_SUBPROC_SCAN_CACHE.get("mm_elapsed_ms", 0) or 0),
+                "mm_summary_len": int(_SUBPROC_SCAN_CACHE.get("mm_summary_len", 0) or 0),
+                "vision_route": str(_SUBPROC_SCAN_CACHE.get("vision_route", "cache")),
                 "reused_cache": True,
             }
 
     ocr_ok, ocr_info = get_ocr_runtime_status()
     ocr_image = _resize_for_ocr(image, int(ocr_max_edge))
-    ocr_text = extract_text(ocr_image)
-    screen_context = f"OCR文本: {ocr_text}" if ocr_text else ""
+    ocr_result = extract_ocr_result(ocr_image)
+    previous_ocr_hash = str(_SUBPROC_SCAN_CACHE.get("ocr_hash", "") or "")
+    if (
+        ocr_result.text_hash
+        and ocr_result.text_hash == previous_ocr_hash
+        and str(_SUBPROC_SCAN_CACHE.get("vision_route", "")) == "ocr_only"
+        and str(_SUBPROC_SCAN_CACHE.get("scene_summary", "")).strip()
+    ):
+        _SUBPROC_SCAN_CACHE["fingerprint"] = fingerprint
+        return {
+            "ocr_ok": ocr_ok,
+            "ocr_info": "ocr_hash_reuse",
+            "mode": str(_SUBPROC_SCAN_CACHE.get("mode", "none")),
+            "screen_context": str(_SUBPROC_SCAN_CACHE.get("screen_context", "")),
+            "ocr_text": str(_SUBPROC_SCAN_CACHE.get("ocr_text", "")),
+            "ocr_confidence": float(_SUBPROC_SCAN_CACHE.get("ocr_confidence", 0.0) or 0.0),
+            "scene_summary": str(_SUBPROC_SCAN_CACHE.get("scene_summary", "")),
+            "scene_should_comment": bool(_SUBPROC_SCAN_CACHE.get("scene_should_comment", False)),
+            "mm_reason": "ocr_hash_cache",
+            "mm_elapsed_ms": 0,
+            "mm_summary_len": int(_SUBPROC_SCAN_CACHE.get("mm_summary_len", 0) or 0),
+            "vision_route": "cache",
+            "reused_cache": True,
+        }
+
+    mm_client = _SUBPROC_MM_RUNTIME.get("client")
+    subproc_settings = _SUBPROC_MM_RUNTIME.get("settings")
+    if subproc_settings is not None:
+        pipeline = _build_ocr_first_context(
+            mm_client,
+            image,
+            ocr_result,
+            subproc_settings,
+            _SUBPROC_MM_RUNTIME,
+            None,
+            respect_vision_interval=True,
+            vision_enabled=False if visual_novel_mode else None,
+        )
+    else:
+        screen_context, mode = _compose_screen_context("", ocr_result.text)
+        pipeline = {
+            "screen_context": screen_context,
+            "mode": mode,
+            "vision_route": "ocr_only",
+            "mm_reason": "off",
+            "mm_elapsed_ms": 0,
+            "mm_summary_len": 0,
+            "ocr_hash": ocr_result.text_hash,
+            "ocr_text": ocr_result.text,
+            "ocr_confidence": ocr_result.average_confidence,
+        }
+
+    screen_context = str(pipeline["screen_context"])
+    mode = str(pipeline["mode"])
     scene = analyze_scene(screen_context)
-    mode = "ocr" if ocr_text else "none"
 
     _SUBPROC_SCAN_CACHE["fingerprint"] = fingerprint
+    _SUBPROC_SCAN_CACHE["ocr_hash"] = str(pipeline.get("ocr_hash", ""))
+    _SUBPROC_SCAN_CACHE["ocr_text"] = str(pipeline.get("ocr_text", ""))
+    _SUBPROC_SCAN_CACHE["ocr_confidence"] = float(pipeline.get("ocr_confidence", 0.0) or 0.0)
     _SUBPROC_SCAN_CACHE["screen_context"] = screen_context
     _SUBPROC_SCAN_CACHE["scene_summary"] = scene.summary
     _SUBPROC_SCAN_CACHE["scene_should_comment"] = scene.should_comment
     _SUBPROC_SCAN_CACHE["mode"] = mode
+    _SUBPROC_SCAN_CACHE["mm_reason"] = str(pipeline.get("mm_reason", "off"))
+    _SUBPROC_SCAN_CACHE["mm_elapsed_ms"] = int(pipeline.get("mm_elapsed_ms", 0) or 0)
+    _SUBPROC_SCAN_CACHE["mm_summary_len"] = int(pipeline.get("mm_summary_len", 0) or 0)
+    _SUBPROC_SCAN_CACHE["vision_route"] = str(pipeline.get("vision_route", "none"))
 
     return {
         "ocr_ok": ocr_ok,
         "ocr_info": ocr_info,
         "mode": mode,
         "screen_context": screen_context,
+        "ocr_text": str(pipeline.get("ocr_text", "")),
+        "ocr_confidence": float(pipeline.get("ocr_confidence", 0.0) or 0.0),
         "scene_summary": scene.summary,
         "scene_should_comment": scene.should_comment,
+        "mm_reason": str(pipeline.get("mm_reason", "off")),
+        "mm_elapsed_ms": int(pipeline.get("mm_elapsed_ms", 0) or 0),
+        "mm_summary_len": int(pipeline.get("mm_summary_len", 0) or 0),
+        "vision_route": str(pipeline.get("vision_route", "none")),
         "reused_cache": False,
     }
 
@@ -184,11 +527,12 @@ def run_scan_pipeline_worker_loop(task_queue, result_queue) -> None:
         if task is None:
             return
         task_id = int(task.get("task_id", 0))
-        monitor_index = int(task.get("scan_monitor_index", 1))
+        monitor_index = int(task.get("scan_monitor_index", 0))
         scan_region = task.get("scan_region")
         ocr_cpu_threads = int(task.get("ocr_cpu_threads", 0))
         ocr_cpu_affinity_count = int(task.get("ocr_cpu_affinity_count", 0))
         ocr_max_edge = int(task.get("ocr_max_edge", 0))
+        visual_novel_mode = bool(task.get("visual_novel_mode", False))
         started_ts = time.time()
         try:
             result = run_scan_pipeline_subprocess(
@@ -197,6 +541,7 @@ def run_scan_pipeline_worker_loop(task_queue, result_queue) -> None:
                 ocr_cpu_threads=ocr_cpu_threads,
                 ocr_cpu_affinity_count=ocr_cpu_affinity_count,
                 ocr_max_edge=ocr_max_edge,
+                visual_novel_mode=visual_novel_mode,
             )
             result_queue.put(
                 {
@@ -234,6 +579,12 @@ def main() -> int:
         "yes",
         "on",
     }
+    filter_live2d_startup_verbose = os.getenv("LIVE2D_FILTER_STARTUP_VERBOSE_LOG", "1").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
     def _pipe_live2d_stream(stream, *, name: str) -> None:
         if stream is None:
@@ -246,6 +597,12 @@ def main() -> int:
                 lowered = line.lower()
                 noisy_motion = ("start motion" in lowered) and (("can't" in lowered) or ("cant" in lowered))
                 if filter_motion_noise_log and noisy_motion:
+                    continue
+                if filter_live2d_startup_verbose and (
+                    "create buffer:" in lowered
+                    or "delete buffer:" in lowered
+                    or "load motion:" in lowered
+                ):
                     continue
                 print(f"[LIVE2D-PY/{name}] {line}")
         except Exception as exc:
@@ -319,20 +676,23 @@ def main() -> int:
             print(f"[STARTUP] Live2D-py start failed: {exc}")
 
     from PyQt6.QtCore import QTimer
-    from PyQt6.QtWidgets import QApplication
+    from PyQt6.QtGui import QCursor, QGuiApplication
+    from PyQt6.QtWidgets import QApplication, QInputDialog, QMessageBox
 
     from desktop_pet.core.scheduler import ScanScheduler
     from desktop_pet.audio.speech import SpeechService
     from desktop_pet.llm.comment_engine import CommentEngine
     from desktop_pet.llm.client import LLMClient
     from desktop_pet.llm.dialog_manager import DialogManager
+    from desktop_pet.llm.semantic_attention import SemanticAttentionRouter
+    from desktop_pet.llm.visual_novel import VisualNovelStoryLibrary, VisualNovelTracker
     from desktop_pet.policy.comment_policy import can_emit_comment
     from desktop_pet.ui.chat_panel import ChatPanel
     from desktop_pet.ui.pet_window import DesktopPet
     from desktop_pet.ui.region_selector import RegionSelectOverlay
-    from desktop_pet.vision.capture import capture_primary_screen, get_monitor_geometry
+    from desktop_pet.vision.capture import capture_primary_screen, find_monitor_index, get_monitor_geometry
     from desktop_pet.vision.multimodal import describe_screen_image, describe_screen_image_compat
-    from desktop_pet.vision.ocr import extract_text, get_ocr_runtime_status
+    from desktop_pet.vision.ocr import extract_ocr_result, get_ocr_runtime_status
     from desktop_pet.vision.scene_analyzer import analyze_scene
 
     app = QApplication(sys.argv)
@@ -359,17 +719,72 @@ def main() -> int:
 
     print(
         "[STARTUP] Scan target:",
-        f"monitor={settings.scan_monitor_index}",
-        f"region={settings.scan_region if settings.scan_region else 'full-monitor'}",
+        f"monitor={settings.scan_monitor_index if settings.scan_monitor_index else 'virtual-desktop'}",
+        f"region={settings.scan_region if settings.scan_region else 'full-target'}",
     )
+    if settings.enable_visual_novel_mode:
+        roi_mode = "manual-region" if settings.scan_region else "bottom-42-percent"
+        print(f"[STARTUP] Visual novel mode: enabled | roi={roi_mode}")
 
     llm_client = LLMClient(settings)
     dialog_memory_path = base_dir / "data" / "chat_long_memory.json"
+    semantic_attention = SemanticAttentionRouter(
+        enabled=settings.enable_semantic_attention,
+        model_path=Path(settings.semantic_attention_model_path),
+        top_k=settings.semantic_attention_top_k,
+        min_score=settings.semantic_attention_min_score,
+        max_length=settings.semantic_attention_max_length,
+        cache_size=settings.semantic_attention_cache_size,
+        cpu_threads=settings.semantic_attention_cpu_threads,
+    )
+    visual_novel_runtime = {"enabled": bool(settings.enable_visual_novel_mode)}
+    visual_novel_library = VisualNovelStoryLibrary(
+        base_dir / "data" / "visual_novel_stories",
+        legacy_path=base_dir / "data" / "visual_novel_story.json",
+    )
+    visual_novel_tracker = VisualNovelTracker(
+        visual_novel_library.active_path,
+        similarity_fn=semantic_attention.similarity,
+        similarities_fn=semantic_attention.similarities,
+        min_context_similarity=settings.visual_novel_min_context_similarity,
+    )
+    print(f"[STARTUP] Visual novel story cache: {visual_novel_library.active_name}")
+
+    def provide_visual_novel_planner_context() -> str:
+        if not visual_novel_runtime["enabled"]:
+            return ""
+        return visual_novel_tracker.build_planner_hint(max_chars=600)
+
     dialog = DialogManager(
         llm_client,
         memory_path=dialog_memory_path,
         tutor_enabled=settings.enable_tutor_persona,
+        semantic_attention=semantic_attention,
+        web_soft_deadline_sec=settings.web_search_soft_deadline_sec,
+        web_hard_deadline_sec=settings.web_search_hard_deadline_sec,
+        web_circuit_failure_threshold=settings.web_search_circuit_failure_threshold,
+        web_circuit_cooldown_sec=settings.web_search_circuit_cooldown_sec,
+        web_max_results=settings.web_search_max_results,
+        web_context_max_chars=settings.web_search_context_max_chars,
+        long_memory_limit=settings.long_memory_limit,
+        long_memory_context_window=settings.long_memory_context_window,
+        visual_novel_context_provider=visual_novel_tracker.retrieve_for_query,
+        visual_novel_planner_context_provider=provide_visual_novel_planner_context,
     )
+    if settings.enable_semantic_attention:
+        def _warmup_semantic_attention() -> None:
+            ok = semantic_attention.warmup()
+            print(
+                "[STARTUP] Semantic attention:",
+                "ready" if ok else "fallback",
+                f"| {semantic_attention.status}",
+            )
+
+        threading.Thread(
+            target=_warmup_semantic_attention,
+            name="semantic-attention-warmup",
+            daemon=True,
+        ).start()
     comment_engine = CommentEngine(
         llm_client,
         tutor_enabled=settings.enable_tutor_persona,
@@ -377,51 +792,25 @@ def main() -> int:
         stressed_keywords_text=settings.emotion_keywords_stressed,
         positive_keywords_text=settings.emotion_keywords_positive,
         focused_keywords_text=settings.emotion_keywords_focused,
+        enable_api_understanding=settings.enable_comment_api_understanding,
     )
-    speech = SpeechService(settings)
 
-    def strip_bracketed_text(text: str) -> str:
-        cleaned = text
-        patterns = [
-            r"\[[^\[\]]*\]",
-            r"\([^\(\)]*\)",
-            r"【[^【】]*】",
-            r"（[^（）]*）",
-        ]
-        for _ in range(4):
-            prev = cleaned
-            for pattern in patterns:
-                cleaned = re.sub(pattern, "", cleaned)
-            if cleaned == prev:
-                break
-        return re.sub(r"\s+", " ", cleaned).strip()
-
-    def to_voicevox_japanese(text: str) -> str:
-        if settings.tts_provider.lower() != "voicevox":
-            return text
-        if not settings.enable_voicevox_ja_translation:
-            return text
-
-        translate_input = strip_bracketed_text(text)
-        if not translate_input:
-            return ""
-
+    def translate_tts_with_api(text: str) -> str:
         try:
             translated = llm_client.chat(
-                user_text=translate_input,
+                user_text=text,
                 system_prompt=SYSTEM_VOICEVOX_TRANSLATE_PROMPT,
             ).strip()
         except Exception:
-            return translate_input[:220]
-
-        if not translated or translated.startswith("[离线回声]"):
-            return translate_input[:220]
-        return translated[:220]
-
-    def prepare_tts_text(text: str) -> str:
-        if not text.strip():
             return ""
-        return to_voicevox_japanese(text)
+        if not translated or translated.startswith("[离线回声]"):
+            return ""
+        return translated[: settings.tts_translation_max_chars]
+
+    speech = SpeechService(
+        settings,
+        translation_api_fallback=translate_tts_with_api,
+    )
 
     def estimate_bubble_duration_ms(display_text: str) -> int:
         visual_chars = len(re.sub(r"\s+", "", display_text))
@@ -437,17 +826,20 @@ def main() -> int:
         return max(2600, min(22000, speech_ms + 800))
 
     def _speak_async(display_text: str) -> None:
-        tts_text = prepare_tts_text(display_text)
-        if tts_text:
-            speech.speak(tts_text)
+        if speech.is_muted():
+            return
+        speech.speak(display_text)
 
     def _speak_async_with_callback(display_text: str, on_start=None) -> None:
-        tts_text = prepare_tts_text(display_text)
-        if not tts_text:
+        if speech.is_muted():
             if callable(on_start):
                 on_start()
             return
-        queued = speech.speak(tts_text, on_start=on_start)
+        if not display_text.strip():
+            if callable(on_start):
+                on_start()
+            return
+        queued = speech.speak(display_text, on_start=on_start)
         if (not queued) and callable(on_start):
             on_start()
 
@@ -473,6 +865,69 @@ def main() -> int:
     def speak_text(text: str) -> None:
         tts_executor.submit(_speak_async, text)
 
+    def on_web_search_toggled(enabled: bool) -> None:
+        dialog.set_web_search_enabled(bool(enabled))
+        if enabled:
+            pet.show_comment_bubble("联网检索已开启", duration_ms=1400)
+        else:
+            pet.show_comment_bubble("联网检索已关闭", duration_ms=1400)
+
+    def on_multimodal_chat_toggled(enabled: bool) -> None:
+        if enabled:
+            pet.show_comment_bubble("手动聊天多模态已开启", duration_ms=1600)
+        else:
+            pet.show_comment_bubble("手动聊天多模态已关闭", duration_ms=1600)
+
+    chat_screen_lock = threading.Lock()
+
+    def provide_chat_screen_context(user_text: str) -> str:
+        # This callback runs after startup in ChatPanel's worker thread. It deliberately
+        # captures a fresh frame instead of reusing the automatic scan cache.
+        with chat_screen_lock:
+            image = capture_primary_screen(
+                monitor_index=int(state["scan_monitor_index"]),
+                region=state["scan_region"],
+            )
+            pipeline = build_screen_context(
+                image,
+                respect_vision_interval=False,
+                vision_enabled=True,
+                focus_query=user_text,
+            )
+        screen_context = str(pipeline.get("screen_context", "") or "").strip()
+        if not screen_context:
+            return ""
+        mode = str(pipeline.get("mode", "none") or "none")
+        return f"屏幕识别模式: {mode}\n{screen_context}"
+
+    def provide_uploaded_image_context(image, user_text: str, ocr_text: str) -> str:
+        compact_ocr = str(ocr_text or "").strip()
+        vision_summary = ""
+        vision_reason = "off"
+        if bool(settings.enable_multimodal_vision):
+            route = "vision+ocr" if compact_ocr else "vision_only"
+            vision_result = describe_screen_image_compat(
+                llm_client,
+                image,
+                timeout_sec=float(settings.mm_timeout_sec),
+                max_edge=int(settings.mm_image_max_edge),
+                ocr_context=compact_ocr[: int(settings.ocr_context_max_chars)],
+                route=route,
+                focus_query=user_text,
+                content_kind="uploaded_image",
+            )
+            vision_summary = str(vision_result.summary or "").strip()
+            vision_reason = str(vision_result.reason or "empty")
+
+        parts = [f"上传图片识别模式: {'vision+ocr' if compact_ocr else 'vision'}"]
+        if compact_ocr:
+            parts.append(f"本地OCR文字:\n{compact_ocr[: int(settings.ocr_context_max_chars)]}")
+        if vision_summary:
+            parts.append(f"Vision视觉摘要:\n{vision_summary}")
+        else:
+            parts.append(f"Vision视觉摘要不可用（{vision_reason}）")
+        return "\n".join(parts)
+
     def on_archive_state_change(active: bool, message: str) -> None:
         if active:
             hint = message.strip() or "妹妹写日记中，请不要关闭"
@@ -488,8 +943,16 @@ def main() -> int:
         dialog_manager=dialog,
         on_pet_reply=speak_text,
         on_archive_state_change=on_archive_state_change,
+        on_web_search_toggled=on_web_search_toggled,
+        screen_context_provider=provide_chat_screen_context,
+        uploaded_image_context_provider=provide_uploaded_image_context,
+        on_multimodal_toggled=on_multimodal_chat_toggled,
         show_system_messages=settings.chat_show_system_messages,
+        web_search_enabled=False,
+        multimodal_chat_enabled=settings.enable_chat_multimodal,
+        screen_context_max_chars=settings.chat_screen_context_max_chars,
     )
+    dialog.set_web_search_enabled(False)
 
     if settings.enable_live2d_py:
         chat.enable_live2d_overlay_mode()
@@ -499,18 +962,25 @@ def main() -> int:
 
     base_comment_interval_sec = max(10, settings.screen_scan_interval_sec)
     if settings.scan_tick_interval_sec > 0:
-        scan_tick_interval_sec = settings.scan_tick_interval_sec
+        normal_scan_tick_interval_sec = settings.scan_tick_interval_sec
     else:
-        scan_tick_interval_sec = max(5, min(15, max(1, base_comment_interval_sec // 6)))
+        normal_scan_tick_interval_sec = max(5, min(15, max(1, base_comment_interval_sec // 6)))
 
     if settings.scan_submit_min_interval_sec > 0:
-        scan_submit_min_interval_sec = settings.scan_submit_min_interval_sec
+        normal_scan_submit_min_interval_sec = settings.scan_submit_min_interval_sec
     else:
         if settings.enable_scan_subprocess:
             # Keep sample cadence close to tick interval; subprocess cache reuse avoids heavy OCR each submit.
-            scan_submit_min_interval_sec = max(5, scan_tick_interval_sec)
+            normal_scan_submit_min_interval_sec = max(5, normal_scan_tick_interval_sec)
         else:
-            scan_submit_min_interval_sec = max(scan_tick_interval_sec, min(15, max(1, base_comment_interval_sec // 3)))
+            normal_scan_submit_min_interval_sec = max(
+                normal_scan_tick_interval_sec,
+                min(15, max(1, base_comment_interval_sec // 3)),
+            )
+    scan_tick_interval_sec = 1 if settings.enable_visual_novel_mode else normal_scan_tick_interval_sec
+    scan_submit_min_interval_sec = (
+        1 if settings.enable_visual_novel_mode else normal_scan_submit_min_interval_sec
+    )
 
     def schedule_next_comment(now: datetime) -> datetime:
         jitter = random.randint(-30, 30)
@@ -531,8 +1001,10 @@ def main() -> int:
         "last_comment_at": None,
         "last_summary": "",
         "last_comment_text": "",
-        "scan_enabled": True,
+        "scan_enabled": False,
+        "visual_novel_mode_enabled": visual_novel_runtime["enabled"],
         "last_pipeline_mode": "",
+        "scan_monitor_index": settings.scan_monitor_index,
         "scan_region": settings.scan_region,
         "region_overlay": None,
         "next_comment_at": next_comment_at,
@@ -545,17 +1017,28 @@ def main() -> int:
         "adaptive_submit_interval_sec": float(scan_submit_min_interval_sec),
         "adaptive_busy_timeout_sec": float(scan_busy_timeout_sec),
         "last_scan_duration_sec": 0.0,
+        "scan_cache_fingerprint": None,
+        "scan_cache_ocr_hash": "",
+        "scan_cache_ocr_text": "",
+        "scan_cache_ocr_confidence": 0.0,
+        "scan_cache_screen_context": "",
+        "scan_cache_scene_summary": "",
+        "scan_cache_scene_should_comment": False,
+        "scan_cache_mode": "none",
+        "scan_cache_vision_route": "none",
         "comment_future": None,
         "pending_comment_meta": None,
+        "vn_last_evaluation_at": None,
         "mm_fail_streak": 0,
         "mm_cooldown_until": None,
+        "mm_last_request_at": None,
     }
 
     if settings.enable_scan_subprocess:
         print("[STARTUP] Auto scan execution: subprocess-persistent")
     else:
         print("[STARTUP] Auto scan execution: thread")
-    scan_executor = None if settings.enable_scan_subprocess else ThreadPoolExecutor(max_workers=1, thread_name_prefix="scan-worker")
+    scan_executor = None
     scan_worker_ctx = None
     scan_task_queue = None
     scan_result_queue = None
@@ -563,6 +1046,12 @@ def main() -> int:
     scan_task_seq = 0
     comment_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="comment-worker")
     tts_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tts-worker")
+
+    def warmup_tts_translation() -> None:
+        status = speech.warmup_translation()
+        print(f"[STARTUP] TTS translation: {'ok' if status.ready else 'fail'} | {status.detail}")
+
+    tts_executor.submit(warmup_tts_translation)
     resource_policy_reapply_min_sec = float(settings.resource_policy_reapply_min_sec)
     follow_activate_distance_px = int(settings.live2d_follow_activate_distance_px)
     follow_enter_distance_px = max(140, follow_activate_distance_px)
@@ -841,6 +1330,7 @@ def main() -> int:
             "ocr_cpu_threads": int(settings.ocr_cpu_threads),
             "ocr_cpu_affinity_count": int(settings.ocr_cpu_affinity_count),
             "ocr_max_edge": int(settings.ocr_max_edge),
+            "visual_novel_mode": bool(state["visual_novel_mode_enabled"]),
         }
         try:
             scan_task_queue.put_nowait(payload)
@@ -919,60 +1409,28 @@ def main() -> int:
             msg += f" | {detail}"
         print(msg)
 
-    def build_screen_context(image) -> tuple[str, str]:
-        parts: list[str] = []
-        mode = "none"
-
-        def _mark_mm_success() -> None:
-            state["mm_fail_streak"] = 0
-            state["mm_cooldown_until"] = None
-
-        def _mark_mm_failure(reason: str) -> None:
-            streak = int(state.get("mm_fail_streak", 0)) + 1
-            state["mm_fail_streak"] = streak
-            threshold = max(1, int(settings.mm_failure_threshold))
-            if streak >= threshold:
-                cooldown_sec = max(10, int(settings.mm_cooldown_sec))
-                state["mm_cooldown_until"] = datetime.now() + timedelta(seconds=cooldown_sec)
-                log_heartbeat("mm_cooldown", f"reason={reason}, streak={streak}, cooldown={cooldown_sec}s")
-            else:
-                log_heartbeat("mm_fail", f"reason={reason}, streak={streak}/{threshold}")
-
-        mm_enabled = bool(settings.enable_multimodal_vision and settings.enable_mm_screen_comment)
-        if mm_enabled:
-            if settings.enable_mm_compat_mode:
-                cooldown_until = state.get("mm_cooldown_until")
-                now = datetime.now()
-                in_cooldown = isinstance(cooldown_until, datetime) and now < cooldown_until
-                if in_cooldown:
-                    remain = int((cooldown_until - now).total_seconds())
-                    log_heartbeat("mm_skip", f"cooldown_remain={max(1, remain)}s")
-                else:
-                    vision_result = describe_screen_image_compat(
-                        llm_client,
-                        image,
-                        timeout_sec=float(settings.mm_timeout_sec),
-                        max_edge=int(settings.mm_image_max_edge),
-                    )
-                    if vision_result.summary:
-                        parts.append(f"视觉摘要: {vision_result.summary}")
-                        mode = "vision"
-                        _mark_mm_success()
-                    else:
-                        _mark_mm_failure(vision_result.reason)
-            else:
-                visual_summary = describe_screen_image(llm_client, image)
-                if visual_summary:
-                    parts.append(f"视觉摘要: {visual_summary}")
-                    mode = "vision"
-
-        ocr_image = _resize_for_ocr(image, int(settings.ocr_max_edge))
-        ocr_text = extract_text(ocr_image)
-        if ocr_text:
-            parts.append(f"OCR文本: {ocr_text}")
-            mode = "vision+ocr" if mode == "vision" else "ocr"
-
-        return "\n".join(parts).strip(), mode
+    def build_screen_context(
+        image,
+        *,
+        respect_vision_interval: bool,
+        ocr_result=None,
+        vision_enabled: bool | None = None,
+        focus_query: str = "",
+    ) -> dict:
+        if ocr_result is None:
+            ocr_image = _resize_for_ocr(image, int(settings.ocr_max_edge))
+            ocr_result = extract_ocr_result(ocr_image)
+        return _build_ocr_first_context(
+            llm_client,
+            image,
+            ocr_result,
+            settings,
+            state,
+            log_heartbeat,
+            respect_vision_interval=respect_vision_interval,
+            vision_enabled=vision_enabled,
+            focus_query=focus_query,
+        )
 
     def maybe_emit_pipeline_status(mode: str):
         if mode == state["last_pipeline_mode"]:
@@ -984,7 +1442,7 @@ def main() -> int:
         elif mode == "vision":
             chat.append_message("系统", "识别状态: 仅多模态视觉")
         elif mode == "ocr":
-            chat.append_message("系统", "识别状态: OCR回退模式")
+            chat.append_message("系统", "识别状态: 仅本地OCR（省Token）")
         else:
             chat.append_message("系统", "识别状态: 未识别到有效内容")
 
@@ -996,17 +1454,36 @@ def main() -> int:
         show_and_speak(comment, role=display_role)
         dialog.record_session_message(role, comment)
 
+    def _normalize_memory_summary(summary: str) -> str:
+        text = str(summary or "").strip()
+        if not text:
+            return ""
+        text = text.replace("屏幕内容摘要:", "")
+        text = " ".join(text.split())
+        return text
+
     def _append_cycle_memory(summary: str) -> None:
-        if not summary:
+        normalized = _normalize_memory_summary(summary)
+        if not normalized:
             return
         captured_at = datetime.now()
         memories = state["cycle_memories"]
-        if memories and memories[-1]["summary"] == summary:
+
+        if memories and memories[-1]["summary"] == normalized:
             memories[-1]["captured_at"] = captured_at
             return
-        memories.append({"summary": summary, "captured_at": captured_at})
-        if len(memories) > 12:
-            del memories[:-12]
+
+        # Fuzzy dedup across nearby screenshots: keep one representative for highly similar text.
+        for item in reversed(memories[-12:]):
+            ratio = text_similarity(normalized, str(item.get("summary", "")))
+            if ratio >= 0.90:
+                item["captured_at"] = captured_at
+                if len(normalized) > len(str(item.get("summary", ""))):
+                    item["summary"] = normalized
+                return
+        memories.append({"summary": normalized, "captured_at": captured_at})
+        if len(memories) > 24:
+            del memories[:-24]
 
     def _compose_cycle_summary(now: datetime) -> tuple[str, str]:
         memories = state["cycle_memories"]
@@ -1020,14 +1497,22 @@ def main() -> int:
         merged: dict[str, dict] = {}
 
         for item in memories:
-            summary = item["summary"]
+            summary = _normalize_memory_summary(item["summary"])
+            if not summary:
+                continue
             captured_at = item["captured_at"]
             age_sec = max(0.0, (now - captured_at).total_seconds())
             weight = max(min_weight, 1.0 - (age_sec / recency_window_sec))
 
-            prev = merged.get(summary)
+            canonical_key = summary
+            for key in merged.keys():
+                if text_similarity(summary, key) >= 0.90:
+                    canonical_key = key
+                    break
+
+            prev = merged.get(canonical_key)
             if prev is None:
-                merged[summary] = {
+                merged[canonical_key] = {
                     "summary": summary,
                     "weight": weight,
                     "captured_at": captured_at,
@@ -1037,42 +1522,171 @@ def main() -> int:
                 prev["weight"] = weight
             if captured_at > prev["captured_at"]:
                 prev["captured_at"] = captured_at
+            if len(summary) > len(str(prev.get("summary", ""))):
+                prev["summary"] = summary
 
         ranked = sorted(
             merged.values(),
             key=lambda x: (x["weight"], x["captured_at"]),
             reverse=True,
-        )[:8]
+        )[:12]
 
-        signature = "；".join(item["summary"] for item in ranked[:5])
+        signature = "；".join(item["summary"] for item in ranked[:8])
         lines: list[str] = []
         for idx, item in enumerate(ranked, start=1):
             tag = "重点" if idx <= 3 else "参考"
             lines.append(f"{tag}[权重{item['weight']:.2f}] {item['summary']}")
 
         composed = "近期扫描记忆（越靠近当前时刻权重越高）:\n" + "\n".join(lines)
-        return composed[:1200], signature[:600]
+        return composed[:6000], signature[:2400]
 
     def run_scan_pipeline() -> dict:
         image = capture_primary_screen(
-            monitor_index=settings.scan_monitor_index,
+            monitor_index=int(state["scan_monitor_index"]),
             region=state["scan_region"],
         )
+        image = _crop_visual_novel_scan_image(
+            image,
+            enabled=bool(state["visual_novel_mode_enabled"]),
+            has_manual_region=state["scan_region"] is not None,
+        )
+        fingerprint = _frame_fingerprint(
+            image,
+            text_sensitive=bool(state["visual_novel_mode_enabled"]),
+        )
+        prev_fingerprint = state.get("scan_cache_fingerprint")
+        if isinstance(prev_fingerprint, bytes):
+            diff_ratio = _fingerprint_diff_ratio(fingerprint, prev_fingerprint)
+            diff_threshold = 0.012 if state["visual_novel_mode_enabled"] else 0.04
+            if diff_ratio < diff_threshold and str(state.get("scan_cache_scene_summary", "")).strip():
+                cached_context = str(state.get("scan_cache_screen_context", "")).strip()
+                scene = analyze_scene(cached_context)
+                return {
+                    "ocr_ok": True,
+                    "ocr_info": "cache_reuse",
+                    "mode": str(state.get("scan_cache_mode", "none")),
+                    "screen_context": cached_context,
+                    "ocr_text": str(state.get("scan_cache_ocr_text", "")),
+                    "ocr_confidence": float(state.get("scan_cache_ocr_confidence", 0.0) or 0.0),
+                    "scene": scene,
+                    "vision_route": "cache",
+                    "reused_cache": True,
+                }
+
         ocr_ok, ocr_info = get_ocr_runtime_status()
-        screen_context, mode = build_screen_context(image)
+        ocr_image = _resize_for_ocr(image, int(settings.ocr_max_edge))
+        ocr_result = extract_ocr_result(ocr_image)
+        previous_ocr_hash = str(state.get("scan_cache_ocr_hash", "") or "")
+        if (
+        ocr_result.text_hash
+        and ocr_result.text_hash == previous_ocr_hash
+        and str(state.get("scan_cache_vision_route", "")) == "ocr_only"
+        and str(state.get("scan_cache_scene_summary", "")).strip()
+        ):
+            state["scan_cache_fingerprint"] = fingerprint
+            cached_context = str(state.get("scan_cache_screen_context", "")).strip()
+            scene = analyze_scene(cached_context)
+            return {
+                "ocr_ok": ocr_ok,
+                "ocr_info": "ocr_hash_reuse",
+                "mode": str(state.get("scan_cache_mode", "none")),
+                "screen_context": cached_context,
+                "ocr_text": str(state.get("scan_cache_ocr_text", "")),
+                "ocr_confidence": float(state.get("scan_cache_ocr_confidence", 0.0) or 0.0),
+                "scene": scene,
+                "vision_route": "cache",
+                "reused_cache": True,
+            }
+
+        pipeline = build_screen_context(
+            image,
+            respect_vision_interval=True,
+            ocr_result=ocr_result,
+            vision_enabled=False if state["visual_novel_mode_enabled"] else None,
+        )
+        screen_context = str(pipeline["screen_context"])
+        mode = str(pipeline["mode"])
         scene = analyze_scene(screen_context)
+        state["scan_cache_fingerprint"] = fingerprint
+        state["scan_cache_ocr_hash"] = str(pipeline.get("ocr_hash", ""))
+        state["scan_cache_ocr_text"] = str(pipeline.get("ocr_text", ""))
+        state["scan_cache_ocr_confidence"] = float(pipeline.get("ocr_confidence", 0.0) or 0.0)
+        state["scan_cache_screen_context"] = screen_context
+        state["scan_cache_scene_summary"] = scene.summary
+        state["scan_cache_scene_should_comment"] = scene.should_comment
+        state["scan_cache_mode"] = mode
+        state["scan_cache_vision_route"] = str(pipeline.get("vision_route", "none"))
         return {
             "ocr_ok": ocr_ok,
             "ocr_info": ocr_info,
             "mode": mode,
             "screen_context": screen_context,
+            "ocr_text": str(pipeline.get("ocr_text", "")),
+            "ocr_confidence": float(pipeline.get("ocr_confidence", 0.0) or 0.0),
             "scene": scene,
+            "vision_route": str(pipeline.get("vision_route", "none")),
+            "reused_cache": False,
         }
 
     def text_similarity(a: str, b: str) -> float:
         if not a or not b:
             return 0.0
         return SequenceMatcher(None, a, b).ratio()
+
+    def _process_visual_novel_text(result: dict, now: datetime) -> None:
+        if visual_novel_tracker is None:
+            return
+        ocr_text = str(result.get("ocr_text", "") or "").strip()
+        if not ocr_text:
+            return
+        ocr_text, quality_reason = visual_novel_tracker.prepare_ocr_text(
+            ocr_text,
+            confidence=float(result.get("ocr_confidence", 0.0) or 0.0),
+        )
+        if not ocr_text:
+            log_heartbeat("vn_skip", quality_reason)
+            return
+        if quality_reason != "quality_ok":
+            log_heartbeat("vn_filter", quality_reason)
+        observation = visual_novel_tracker.observe(
+            ocr_text,
+            confidence=float(result.get("ocr_confidence", 0.0) or 0.0),
+        )
+        if not observation.accepted:
+            log_heartbeat("vn_skip", observation.reason)
+        else:
+            log_heartbeat(
+                "vn_buffer",
+                f"reason={observation.reason}, semantic_score={observation.semantic_score:.2f}",
+            )
+        if not visual_novel_tracker.has_pending_evaluation or state["comment_future"] is not None:
+            return
+
+        last_evaluation_at = state.get("vn_last_evaluation_at")
+        if isinstance(last_evaluation_at, datetime) and (now - last_evaluation_at).total_seconds() < 12.0:
+            log_heartbeat("vn_wait", "evaluation_rate_limit")
+            return
+
+        allow_comment = can_emit_comment(state["last_comment_at"], settings.auto_comment_cooldown_sec)
+        if not allow_comment:
+            log_heartbeat("vn_wait", "comment_cooldown")
+            return
+        payload = visual_novel_tracker.build_evaluation_payload()
+        if payload is None:
+            return
+        state["comment_future"] = comment_executor.submit(
+            comment_engine.evaluate_visual_novel,
+            payload,
+        )
+        state["vn_last_evaluation_at"] = now
+        state["pending_comment_meta"] = {
+            "kind": "visual_novel",
+            "now": now,
+            "allow_comment": allow_comment,
+            "reason": str(payload.get("reason", "")),
+            "summary_len": len(str(payload.get("scene_summary", ""))),
+        }
+        log_heartbeat("vn_evaluate", f"reason={payload.get('reason', 'unknown')}")
 
     def poll_comment_future() -> None:
         future = state["comment_future"]
@@ -1087,9 +1701,28 @@ def main() -> int:
         state["pending_comment_meta"] = None
 
         try:
-            comment = future.result()
+            generated = future.result()
         except Exception as exc:
             log_heartbeat("error", f"comment_generate_failed: {exc}")
+            return
+
+        if meta.get("kind") == "visual_novel":
+            evaluation = generated if isinstance(generated, dict) else {}
+            if visual_novel_tracker is not None:
+                visual_novel_tracker.apply_evaluation(evaluation)
+            if not bool(meta.get("allow_comment", False)):
+                log_heartbeat("vn_skip", "summary_updated_during_cooldown")
+                return
+            if not bool(evaluation.get("should_comment", False)):
+                log_heartbeat("vn_skip", f"moment={evaluation.get('moment_type', 'ordinary')}")
+                return
+            comment = str(evaluation.get("comment", "")).strip()
+        else:
+            comment = generated
+
+        comment = str(comment or "").strip()
+        if not comment:
+            log_heartbeat("skip", "comment_empty_or_fallback_suppressed")
             return
 
         similarity = text_similarity(comment, state["last_comment_text"])
@@ -1103,7 +1736,8 @@ def main() -> int:
         state["last_comment_at"] = meta.get("now", datetime.now())
         state["last_summary"] = meta.get("cycle_signature", "")
         state["last_comment_text"] = comment
-        _emit_comment(comment, role="桌宠(自动)")
+        role = "桌宠(视觉小说)" if meta.get("kind") == "visual_novel" else "桌宠(自动)"
+        _emit_comment(comment, role=role)
         log_heartbeat(
             "emit",
             f"cycle_items={meta.get('cycle_items', 0)}, summary_len={meta.get('summary_len', 0)}",
@@ -1145,7 +1779,10 @@ def main() -> int:
                         return
 
                 if settings.enable_scan_subprocess:
-                    task_id = _submit_scan_worker_task(settings.scan_monitor_index, state["scan_region"])
+                    task_id = _submit_scan_worker_task(
+                        int(state["scan_monitor_index"]),
+                        state["scan_region"],
+                    )
                     if task_id <= 0:
                         log_heartbeat("scan_wait", "worker_queue_full")
                         return
@@ -1225,10 +1862,18 @@ def main() -> int:
 
             mode = result["mode"]
             screen_context = result["screen_context"]
+            vision_route = str(result.get("vision_route", "none"))
             reused_cache = bool(result.get("reused_cache", False))
             if settings.enable_scan_subprocess:
                 scene_summary = str(result.get("scene_summary", "")).strip()
                 scene_should_comment = bool(result.get("scene_should_comment", False))
+                mm_reason = str(result.get("mm_reason", "off"))
+                mm_elapsed_ms = int(result.get("mm_elapsed_ms", 0) or 0)
+                mm_summary_len = int(result.get("mm_summary_len", 0) or 0)
+                log_heartbeat(
+                    "mm_result",
+                    f"route={vision_route}, reason={mm_reason}, elapsed_ms={mm_elapsed_ms}, len={mm_summary_len}",
+                )
             else:
                 scene_obj = result["scene"]
                 scene_summary = scene_obj.summary
@@ -1237,12 +1882,16 @@ def main() -> int:
             log_heartbeat(
                 "context_built",
                 (
-                    f"mode={mode}, src={cache_tag}, len={len(screen_context)}, "
+                    f"mode={mode}, route={vision_route}, src={cache_tag}, len={len(screen_context)}, "
                     f"scan_dur={duration_sec:.1f}s, next_submit_min={state['adaptive_submit_interval_sec']:.1f}s, "
                     f"busy_timeout={state['adaptive_busy_timeout_sec']:.1f}s"
                 ),
             )
             maybe_emit_pipeline_status(mode)
+
+            if state["visual_novel_mode_enabled"]:
+                _process_visual_novel_text(result, datetime.now())
+                return
 
             if scene_should_comment:
                 _append_cycle_memory(scene_summary)
@@ -1281,6 +1930,7 @@ def main() -> int:
                 long_memory_hint,
                 settings.screen_comment_memory_weight,
                 recent_dialog_hint,
+                True,
             )
             state["pending_comment_meta"] = {
                 "now": now,
@@ -1299,10 +1949,12 @@ def main() -> int:
     def do_manual_comment() -> None:
         try:
             image = capture_primary_screen(
-                monitor_index=settings.scan_monitor_index,
+                monitor_index=int(state["scan_monitor_index"]),
                 region=state["scan_region"],
             )
-            screen_context, mode = build_screen_context(image)
+            pipeline = build_screen_context(image, respect_vision_interval=False)
+            screen_context = str(pipeline["screen_context"])
+            mode = str(pipeline["mode"])
             maybe_emit_pipeline_status(mode)
             scene = analyze_scene(screen_context)
             if not scene.summary:
@@ -1322,9 +1974,15 @@ def main() -> int:
             chat.append_message("系统", f"手动评论失败: {exc}")
 
     def on_scan_toggle(enabled: bool) -> None:
+        nonlocal scan_executor
+        enabled = bool(enabled)
         state["scan_enabled"] = enabled
         pet.set_auto_scan_enabled(enabled)
         if enabled:
+            if settings.enable_scan_subprocess:
+                _start_scan_worker()
+            elif scan_executor is None:
+                scan_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="scan-worker")
             state["next_comment_at"] = schedule_next_comment(datetime.now())
             state["cycle_memories"] = []
             state["scan_timeout_streak"] = 0
@@ -1335,13 +1993,215 @@ def main() -> int:
             _apply_runtime_resource_policy(scan_active=False, force=True)
             scheduler.start()
             chat.append_message("系统", "已开启自动扫描")
-            pet.show_comment_bubble("自动扫描已开启")
+            pet.show_comment_bubble("自动扫描已开启", duration_ms=1800)
         else:
+            scheduler.stop()
+            scan_future = state.get("scan_future")
+            if scan_future is not None and hasattr(scan_future, "cancel"):
+                try:
+                    scan_future.cancel()
+                except Exception:
+                    pass
+            state["scan_future"] = None
+            state["scan_started_at"] = None
+            state["last_scan_submit_at"] = None
+            comment_future = state.get("comment_future")
+            if comment_future is not None and hasattr(comment_future, "cancel"):
+                try:
+                    comment_future.cancel()
+                except Exception:
+                    pass
+            state["comment_future"] = None
+            state["pending_comment_meta"] = None
+            state["cycle_memories"] = []
+            if settings.enable_scan_subprocess:
+                _stop_scan_worker()
+            elif scan_executor is not None:
+                scan_executor.shutdown(wait=False, cancel_futures=True)
+                scan_executor = None
             pet.set_scan_busy(False)
             _apply_runtime_resource_policy(scan_active=False, force=True)
-            scheduler.stop()
-            chat.append_message("系统", "已暂停自动扫描")
-            pet.show_comment_bubble("自动扫描已暂停")
+            chat.append_message("系统", "已关闭自动扫描；手动评论和聊天多模态仍可使用")
+            pet.show_comment_bubble("自动扫描已关闭", duration_ms=1800)
+
+    def on_visual_novel_mode_toggled(enabled: bool) -> None:
+        nonlocal scan_executor, scan_tick_interval_sec, scan_submit_min_interval_sec
+        enabled = bool(enabled)
+        if enabled == bool(state["visual_novel_mode_enabled"]):
+            pet.set_visual_novel_mode_enabled(enabled)
+            return
+
+        state["visual_novel_mode_enabled"] = enabled
+        visual_novel_runtime["enabled"] = enabled
+        scan_tick_interval_sec = 1 if enabled else normal_scan_tick_interval_sec
+        scan_submit_min_interval_sec = 1 if enabled else normal_scan_submit_min_interval_sec
+        scheduler.set_interval(scan_tick_interval_sec)
+        state["adaptive_submit_interval_sec"] = float(scan_submit_min_interval_sec)
+        state["scan_timeout_streak"] = 0
+        state["scan_backoff_until"] = None
+        state["last_scan_submit_at"] = None
+        state["cycle_memories"] = []
+        state["scan_cache_fingerprint"] = None
+        state["scan_cache_ocr_hash"] = ""
+        state["scan_cache_ocr_text"] = ""
+        state["scan_cache_ocr_confidence"] = 0.0
+        state["scan_cache_screen_context"] = ""
+        state["scan_cache_scene_summary"] = ""
+        state["scan_cache_scene_should_comment"] = False
+        state["scan_cache_mode"] = "none"
+        state["scan_cache_vision_route"] = "none"
+
+        scan_future = state.get("scan_future")
+        if scan_future is not None and hasattr(scan_future, "cancel"):
+            try:
+                scan_future.cancel()
+            except Exception:
+                pass
+        state["scan_future"] = None
+        state["scan_started_at"] = None
+        pet.set_scan_busy(False)
+
+        comment_future = state.get("comment_future")
+        if comment_future is not None and hasattr(comment_future, "cancel"):
+            try:
+                comment_future.cancel()
+            except Exception:
+                pass
+        state["comment_future"] = None
+        state["pending_comment_meta"] = None
+
+        if state["scan_enabled"] and settings.enable_scan_subprocess:
+            _stop_scan_worker()
+            _start_scan_worker()
+            _drain_scan_results()
+        elif state["scan_enabled"] and scan_executor is not None:
+            scan_executor.shutdown(wait=False, cancel_futures=True)
+            scan_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="scan-worker")
+
+        if not enabled:
+            visual_novel_tracker.flush()
+        pet.set_visual_novel_mode_enabled(enabled)
+        mode_text = "已开启" if enabled else "已关闭"
+        chat.append_message("系统", f"视觉小说模式{mode_text}")
+        pet.show_comment_bubble(f"视觉小说模式{mode_text}", duration_ms=1800)
+        log_heartbeat(
+            "vn_mode",
+            f"enabled={enabled}, scan_tick={scan_tick_interval_sec}s, submit_min={scan_submit_min_interval_sec}s",
+        )
+
+    def _switch_visual_novel_story(filename: str) -> None:
+        nonlocal scan_executor
+        target_path = visual_novel_library.directory / filename
+        if target_path == visual_novel_tracker.path:
+            pet.set_visual_novel_story_name(filename)
+            return
+
+        pending_meta = state.get("pending_comment_meta")
+        if isinstance(pending_meta, dict) and pending_meta.get("kind") == "visual_novel":
+            comment_future = state.get("comment_future")
+            if comment_future is not None and hasattr(comment_future, "cancel"):
+                try:
+                    comment_future.cancel()
+                except Exception:
+                    pass
+            state["comment_future"] = None
+            state["pending_comment_meta"] = None
+
+        scan_future = state.get("scan_future")
+        if scan_future is not None and hasattr(scan_future, "cancel"):
+            try:
+                scan_future.cancel()
+            except Exception:
+                pass
+        state["scan_future"] = None
+        state["scan_started_at"] = None
+        state["last_scan_submit_at"] = None
+        pet.set_scan_busy(False)
+        if state["scan_enabled"] and settings.enable_scan_subprocess:
+            _stop_scan_worker()
+            _start_scan_worker()
+            _drain_scan_results()
+        elif state["scan_enabled"] and scan_executor is not None:
+            scan_executor.shutdown(wait=False, cancel_futures=True)
+            scan_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="scan-worker")
+
+        visual_novel_tracker.switch_story(target_path)
+        visual_novel_library.set_active(filename)
+        state["vn_last_evaluation_at"] = None
+        state["scan_cache_fingerprint"] = None
+        state["scan_cache_ocr_hash"] = ""
+        state["scan_cache_ocr_text"] = ""
+        state["scan_cache_ocr_confidence"] = 0.0
+        state["scan_cache_screen_context"] = ""
+        state["scan_cache_scene_summary"] = ""
+        state["scan_cache_scene_should_comment"] = False
+        state["scan_cache_mode"] = "none"
+        state["scan_cache_vision_route"] = "none"
+        pet.set_visual_novel_story_name(filename)
+
+    def on_visual_novel_story_manager_requested() -> None:
+        action, ok = QInputDialog.getItem(
+            pet,
+            "剧情缓存",
+            f"当前缓存：{visual_novel_library.active_name}\n请选择操作：",
+            ["新建缓存", "载入缓存", "删除缓存"],
+            0,
+            False,
+        )
+        if not ok:
+            return
+        try:
+            if action == "新建缓存":
+                name, accepted = QInputDialog.getText(
+                    pet,
+                    "新建剧情缓存",
+                    "输入游戏名或缓存名：",
+                )
+                if not accepted:
+                    return
+                path = visual_novel_library.create(name)
+                _switch_visual_novel_story(path.name)
+                chat.append_message("系统", f"已新建并载入剧情缓存：{path.name}")
+                pet.show_comment_bubble(f"已切换缓存：{path.stem}", duration_ms=2200)
+                return
+
+            stories = visual_novel_library.list_stories()
+            current_index = stories.index(visual_novel_library.active_name)
+            filename, accepted = QInputDialog.getItem(
+                pet,
+                "载入剧情缓存" if action == "载入缓存" else "删除剧情缓存",
+                "选择缓存文件：",
+                stories,
+                current_index,
+                False,
+            )
+            if not accepted:
+                return
+            if action == "载入缓存":
+                _switch_visual_novel_story(filename)
+                chat.append_message("系统", f"已载入剧情缓存：{filename}")
+                pet.show_comment_bubble(f"已切换缓存：{Path(filename).stem}", duration_ms=2200)
+                return
+
+            if len(stories) <= 1:
+                raise ValueError("至少需要保留一个剧情缓存")
+            answer = QMessageBox.question(
+                pet,
+                "删除剧情缓存",
+                f"确定永久删除“{filename}”吗？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            if filename == visual_novel_library.active_name:
+                replacement = next(item for item in stories if item != filename)
+                _switch_visual_novel_story(replacement)
+            visual_novel_library.delete(filename)
+            chat.append_message("系统", f"已删除剧情缓存：{filename}")
+            pet.show_comment_bubble(f"已删除缓存：{Path(filename).stem}", duration_ms=2200)
+        except Exception as exc:
+            QMessageBox.warning(pet, "剧情缓存操作失败", str(exc))
 
     def on_tts_mute_toggled(muted: bool) -> None:
         speech.set_muted(muted)
@@ -1375,14 +2235,39 @@ def main() -> int:
 
     def on_select_scan_region() -> None:
         try:
-            monitor_geo = get_monitor_geometry(settings.scan_monitor_index)
-            overlay = RegionSelectOverlay(monitor_geo)
+            qt_screen = QGuiApplication.screenAt(QCursor.pos()) or QGuiApplication.primaryScreen()
+            if qt_screen is None:
+                raise RuntimeError("未找到可用显示器")
+            qt_geometry = qt_screen.geometry()
+            logical_geometry = (
+                int(qt_geometry.x()),
+                int(qt_geometry.y()),
+                int(qt_geometry.width()),
+                int(qt_geometry.height()),
+            )
+            monitor_index = find_monitor_index(qt_geometry.x(), qt_geometry.y())
+            _left, _top, capture_width, capture_height = get_monitor_geometry(monitor_index)
+            overlay = RegionSelectOverlay(
+                logical_geometry,
+                capture_size=(int(capture_width), int(capture_height)),
+            )
             state["region_overlay"] = overlay
 
             def _on_selected(region: tuple[int, int, int, int]) -> None:
+                state["scan_monitor_index"] = monitor_index
                 state["scan_region"] = region
-                chat.append_message("系统", f"已设置扫描区域: {region}")
-                pet.show_comment_bubble("扫描区域已更新")
+                state["scan_cache_fingerprint"] = None
+                state["scan_cache_ocr_hash"] = ""
+                state["scan_cache_ocr_text"] = ""
+                state["scan_cache_ocr_confidence"] = 0.0
+                state["scan_cache_screen_context"] = ""
+                state["scan_cache_scene_summary"] = ""
+                state["scan_cache_vision_route"] = "none"
+                chat.append_message("系统", f"已设置显示器{monitor_index}扫描区域: {region}")
+                pet.show_comment_bubble(
+                    f"扫描区域已更新：显示器{monitor_index}，{region[2]}×{region[3]}",
+                    duration_ms=2400,
+                )
                 state["region_overlay"] = None
 
             def _on_cancelled() -> None:
@@ -1397,12 +2282,22 @@ def main() -> int:
             chat.append_message("系统", f"区域选择失败: {exc}")
 
     def on_clear_scan_region() -> None:
+        state["scan_monitor_index"] = 0
         state["scan_region"] = None
-        chat.append_message("系统", "已清除扫描区域，恢复整屏扫描")
-        pet.show_comment_bubble("已恢复整屏扫描")
+        state["scan_cache_fingerprint"] = None
+        state["scan_cache_ocr_hash"] = ""
+        state["scan_cache_ocr_text"] = ""
+        state["scan_cache_ocr_confidence"] = 0.0
+        state["scan_cache_screen_context"] = ""
+        state["scan_cache_scene_summary"] = ""
+        state["scan_cache_vision_route"] = "none"
+        chat.append_message("系统", "已清除扫描区域，恢复整个虚拟桌面扫描")
+        pet.show_comment_bubble("已恢复所有屏幕扫描")
 
     def on_quit_requested() -> None:
         scheduler.stop()
+        if visual_novel_tracker is not None:
+            visual_novel_tracker.flush()
         pet.set_scan_busy(False)
         _apply_runtime_resource_policy(scan_active=False, force=True)
         future = state.get("scan_future")
@@ -1936,12 +2831,13 @@ def main() -> int:
             )
             last_zorder_sync_ts = now_ts
 
-    if settings.enable_scan_subprocess:
+    if state["scan_enabled"] and settings.enable_scan_subprocess:
         _start_scan_worker()
 
     scheduler = ScanScheduler(scan_tick_interval_sec)
     scheduler.tick.connect(do_auto_comment)
-    scheduler.start()
+    if state["scan_enabled"]:
+        scheduler.start()
 
     chat.comment_btn.clicked.disconnect()
     chat.comment_btn.clicked.connect(do_manual_comment)
@@ -1957,6 +2853,8 @@ def main() -> int:
     pet.open_chat_requested.connect(on_new_chat_requested)
     pet.auto_comment_requested.connect(do_manual_comment)
     pet.auto_scan_toggled.connect(on_scan_toggle)
+    pet.visual_novel_mode_toggled.connect(on_visual_novel_mode_toggled)
+    pet.visual_novel_story_manager_requested.connect(on_visual_novel_story_manager_requested)
     pet.tts_mute_toggled.connect(on_tts_mute_toggled)
     pet.gaze_follow_toggled.connect(on_gaze_follow_toggled)
     pet.tutor_mode_toggled.connect(on_tutor_mode_toggled)
@@ -1964,7 +2862,9 @@ def main() -> int:
     pet.clear_scan_region_requested.connect(on_clear_scan_region)
     pet.quit_requested.connect(on_quit_requested)
 
-    pet.set_auto_scan_enabled(True)
+    pet.set_auto_scan_enabled(state["scan_enabled"])
+    pet.set_visual_novel_mode_enabled(state["visual_novel_mode_enabled"])
+    pet.set_visual_novel_story_name(visual_novel_library.active_name)
     pet.set_tts_muted(False)
     pet.set_gaze_follow_enabled(settings.live2d_follow_cursor)
     pet.set_tutor_mode_enabled(settings.enable_tutor_persona)
@@ -1993,6 +2893,8 @@ def main() -> int:
         QTimer.singleShot(500, _try_sync_live2d_py_windows)
 
     app.aboutToQuit.connect(speech.shutdown)
+    if visual_novel_tracker is not None:
+        app.aboutToQuit.connect(visual_novel_tracker.flush)
     app.aboutToQuit.connect(lambda: live2d_py_process and live2d_py_process.terminate())
     if settings.enable_scan_subprocess:
         app.aboutToQuit.connect(_stop_scan_worker)

@@ -20,6 +20,8 @@ class DesktopPet(QWidget):
     open_chat_requested = pyqtSignal()
     auto_comment_requested = pyqtSignal()
     auto_scan_toggled = pyqtSignal(bool)
+    visual_novel_mode_toggled = pyqtSignal(bool)
+    visual_novel_story_manager_requested = pyqtSignal()
     quit_requested = pyqtSignal()
     select_scan_region_requested = pyqtSignal()
     clear_scan_region_requested = pyqtSignal()
@@ -53,7 +55,8 @@ class DesktopPet(QWidget):
         self.resize_margin = 16
         self.aspect_ratio = 1.0
         self.default_scale = 0.4
-        self.auto_scan_enabled = True
+        self.auto_scan_enabled = False
+        self.visual_novel_mode_enabled = bool(settings.enable_visual_novel_mode)
         self.tts_muted = False
         self.gaze_follow_enabled = bool(settings.live2d_follow_cursor)
         self.tutor_mode_enabled = bool(settings.enable_tutor_persona)
@@ -66,6 +69,8 @@ class DesktopPet(QWidget):
         self.btn_chat = None
         self.btn_comment = None
         self.btn_toggle_scan = None
+        self.btn_visual_novel = None
+        self.btn_story_cache = None
         self.btn_select_region = None
         self.btn_clear_region = None
         self.btn_tts = None
@@ -213,7 +218,18 @@ class DesktopPet(QWidget):
 
         self.btn_chat = make_btn("聊天")
         self.btn_comment = make_btn("评论")
-        self.btn_toggle_scan = make_btn("暂停扫描")
+        self.btn_toggle_scan = make_btn("自动扫描：关")
+        self.btn_toggle_scan.setCheckable(True)
+        self.btn_toggle_scan.setChecked(False)
+        self.btn_toggle_scan.setToolTip("关闭后停止后台自动截图、OCR和自动评论；不影响手动屏幕读取。")
+        self.btn_visual_novel = make_btn(
+            "视觉小说：开" if self.visual_novel_mode_enabled else "视觉小说：关"
+        )
+        self.btn_visual_novel.setCheckable(True)
+        self.btn_visual_novel.setChecked(self.visual_novel_mode_enabled)
+        self.btn_visual_novel.setToolTip("开启后自动扫描会使用文本区 OCR、剧情缓存和语义时机评论。")
+        self.btn_story_cache = make_btn("剧情缓存")
+        self.btn_story_cache.setToolTip("新建、载入或删除不同游戏的剧情缓存。")
         self.btn_select_region = make_btn("选区域")
         self.btn_clear_region = make_btn("清区域")
         self.btn_tts = make_btn("静音")
@@ -224,6 +240,8 @@ class DesktopPet(QWidget):
         row.addWidget(self.btn_chat)
         row.addWidget(self.btn_comment)
         row.addWidget(self.btn_toggle_scan)
+        row.addWidget(self.btn_visual_novel)
+        row.addWidget(self.btn_story_cache)
         row.addWidget(self.btn_select_region)
         row.addWidget(self.btn_clear_region)
         row.addWidget(self.btn_tts)
@@ -234,7 +252,11 @@ class DesktopPet(QWidget):
 
         self.btn_chat.clicked.connect(self.open_chat_requested.emit)
         self.btn_comment.clicked.connect(self.auto_comment_requested.emit)
-        self.btn_toggle_scan.clicked.connect(lambda: self.auto_scan_toggled.emit(not self.auto_scan_enabled))
+        self.btn_toggle_scan.clicked.connect(lambda enabled: self.auto_scan_toggled.emit(bool(enabled)))
+        self.btn_visual_novel.clicked.connect(
+            lambda enabled: self.visual_novel_mode_toggled.emit(bool(enabled))
+        )
+        self.btn_story_cache.clicked.connect(self.visual_novel_story_manager_requested.emit)
         self.btn_select_region.clicked.connect(self.select_scan_region_requested.emit)
         self.btn_clear_region.clicked.connect(self.clear_scan_region_requested.emit)
         self.btn_tts.clicked.connect(lambda: self.tts_mute_toggled.emit(not self.tts_muted))
@@ -274,7 +296,18 @@ class DesktopPet(QWidget):
 
         self.btn_chat = make_btn("聊天")
         self.btn_comment = make_btn("评论")
-        self.btn_toggle_scan = make_btn("暂停扫描")
+        self.btn_toggle_scan = make_btn("自动扫描：关")
+        self.btn_toggle_scan.setCheckable(True)
+        self.btn_toggle_scan.setChecked(False)
+        self.btn_toggle_scan.setToolTip("关闭后停止后台自动截图、OCR和自动评论；不影响手动屏幕读取。")
+        self.btn_visual_novel = make_btn(
+            "视觉小说：开" if self.visual_novel_mode_enabled else "视觉小说：关"
+        )
+        self.btn_visual_novel.setCheckable(True)
+        self.btn_visual_novel.setChecked(self.visual_novel_mode_enabled)
+        self.btn_visual_novel.setToolTip("开启后自动扫描会使用文本区 OCR、剧情缓存和语义时机评论。")
+        self.btn_story_cache = make_btn("剧情缓存")
+        self.btn_story_cache.setToolTip("新建、载入或删除不同游戏的剧情缓存。")
         self.btn_select_region = make_btn("选区域")
         self.btn_clear_region = make_btn("清区域")
         self.btn_tts = make_btn("静音")
@@ -285,6 +318,8 @@ class DesktopPet(QWidget):
         row.addWidget(self.btn_chat)
         row.addWidget(self.btn_comment)
         row.addWidget(self.btn_toggle_scan)
+        row.addWidget(self.btn_visual_novel)
+        row.addWidget(self.btn_story_cache)
         row.addWidget(self.btn_select_region)
         row.addWidget(self.btn_clear_region)
         row.addWidget(self.btn_tts)
@@ -295,7 +330,11 @@ class DesktopPet(QWidget):
 
         self.btn_chat.clicked.connect(self.open_chat_requested.emit)
         self.btn_comment.clicked.connect(self.auto_comment_requested.emit)
-        self.btn_toggle_scan.clicked.connect(lambda: self.auto_scan_toggled.emit(not self.auto_scan_enabled))
+        self.btn_toggle_scan.clicked.connect(lambda enabled: self.auto_scan_toggled.emit(bool(enabled)))
+        self.btn_visual_novel.clicked.connect(
+            lambda enabled: self.visual_novel_mode_toggled.emit(bool(enabled))
+        )
+        self.btn_story_cache.clicked.connect(self.visual_novel_story_manager_requested.emit)
         self.btn_select_region.clicked.connect(self.select_scan_region_requested.emit)
         self.btn_clear_region.clicked.connect(self.clear_scan_region_requested.emit)
         self.btn_tts.clicked.connect(lambda: self.tts_mute_toggled.emit(not self.tts_muted))
@@ -359,6 +398,10 @@ class DesktopPet(QWidget):
             self.btn_comment.setVisible(self._controls_visible)
         if self.btn_toggle_scan is not None:
             self.btn_toggle_scan.setVisible(self._controls_visible)
+        if self.btn_visual_novel is not None:
+            self.btn_visual_novel.setVisible(self._controls_visible)
+        if self.btn_story_cache is not None:
+            self.btn_story_cache.setVisible(self._controls_visible)
         if self.btn_select_region is not None:
             self.btn_select_region.setVisible(self._controls_visible)
         if self.btn_clear_region is not None:
@@ -645,9 +688,24 @@ class DesktopPet(QWidget):
         self.bubble.hide()
 
     def set_auto_scan_enabled(self, enabled: bool):
-        self.auto_scan_enabled = enabled
+        self.auto_scan_enabled = bool(enabled)
         if self.btn_toggle_scan is not None:
-            self.btn_toggle_scan.setText("暂停扫描" if enabled else "开始扫描")
+            self.btn_toggle_scan.setChecked(self.auto_scan_enabled)
+            self.btn_toggle_scan.setText("自动扫描：开" if self.auto_scan_enabled else "自动扫描：关")
+
+    def set_visual_novel_mode_enabled(self, enabled: bool):
+        self.visual_novel_mode_enabled = bool(enabled)
+        if self.btn_visual_novel is not None:
+            self.btn_visual_novel.setChecked(self.visual_novel_mode_enabled)
+            self.btn_visual_novel.setText(
+                "视觉小说：开" if self.visual_novel_mode_enabled else "视觉小说：关"
+            )
+
+    def set_visual_novel_story_name(self, name: str):
+        if self.btn_story_cache is not None:
+            self.btn_story_cache.setToolTip(
+                f"当前缓存：{str(name or '未知')}\n点击新建、载入或删除剧情缓存。"
+            )
 
     def set_tts_muted(self, muted: bool):
         self.tts_muted = muted

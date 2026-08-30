@@ -17,3 +17,6 @@ class ScanScheduler(QObject):
 
     def stop(self) -> None:
         self._timer.stop()
+
+    def set_interval(self, interval_sec: int) -> None:
+        self._timer.setInterval(max(1, int(interval_sec)) * 1000)

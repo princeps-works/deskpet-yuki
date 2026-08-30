@@ -113,8 +113,8 @@ def get_system_screen_comment_prompt(*, tutor_enabled: bool = False) -> str:
 SYSTEM_SCREEN_COMMENT_PROMPT = get_system_screen_comment_prompt(tutor_enabled=False)
 
 SYSTEM_VISION_PROMPT = (
-    "你是屏幕理解助手。请基于截图提取关键视觉信息，"
-    "输出简短中文摘要，重点包含场景、主体、界面类型和明显行为。"
+    "你是视觉理解助手。请基于屏幕截图或用户上传图片提取关键视觉信息，"
+    "输出简短中文摘要，重点包含场景、主体、界面类型、外观特征和明显行为。"
 )
 
 SYSTEM_VOICEVOX_TRANSLATE_PROMPT = (

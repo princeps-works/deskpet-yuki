@@ -93,12 +93,72 @@ Notes:
 - Project-relative path is resolved from the project root.
 - ENABLE_VOICEVOX_AUTO_LAUNCH=true allows auto-launch when API is unreachable.
 
+### Offline Chinese-to-Japanese Translation
+
+VOICEVOX translation is centralized inside `SpeechService`. Chinese text is never sent directly to a Japanese-only speaker when translation fails.
+
+Install the conversion dependencies and prepare the local model once:
+
+```powershell
+python -m pip install "transformers>=4.48,<5" huggingface-hub sentencepiece ctranslate2
+python scripts/setup_local_translation.py
+```
+
+The setup command downloads `facebook/m2m100_418M`, converts it to CTranslate2 `int8_float16`, and stores the runtime model under `assets/models/m2m100_418M_ct2`. Subsequent translation is fully local. The translated short sentences are persisted in an LRU cache under `data/tts_translation_cache.json`.
+
+Recommended settings:
+
+```env
+ENABLE_VOICEVOX_JA_TRANSLATION=true
+TTS_TRANSLATION_PROVIDER=local
+TTS_TRANSLATION_MODEL_PATH=assets/models/m2m100_418M_ct2
+TTS_TRANSLATION_DEVICE=cuda
+TTS_TRANSLATION_COMPUTE_TYPE=int8_float16
+TTS_TRANSLATION_CACHE_SIZE=2000
+ENABLE_TTS_TRANSLATION_API_FALLBACK=false
+TTS_SKIP_ON_TRANSLATION_FAILURE=true
+```
+
+### Local Semantic Attention
+
+Manual chat can use a local Chinese embedding model to rank recent dialogue, long-term memory,
+web results, OCR, and vision descriptions before the main LLM request. The ranking changes which
+chunks are sent and how much text is retained; its scores are not merely prompt annotations.
+
+Prepare the quantized ONNX model once:
+
+```powershell
+python scripts/setup_semantic_attention.py
+```
+
+The model is stored under `assets/models/bge-small-zh-v1.5-onnx`. Runtime inference uses the
+already-required `transformers`, `onnxruntime`, and `numpy` packages; PyTorch is not required.
+If the model is absent or cannot load, chat automatically keeps the previous truncation behavior.
+
+Recommended semantic-attention settings:
+
+```env
+ENABLE_SEMANTIC_ATTENTION=true
+SEMANTIC_ATTENTION_MODEL_PATH=assets/models/bge-small-zh-v1.5-onnx
+SEMANTIC_ATTENTION_TOP_K=8
+SEMANTIC_ATTENTION_MIN_SCORE=0.34
+SEMANTIC_ATTENTION_MAX_LENGTH=256
+SEMANTIC_ATTENTION_CACHE_SIZE=512
+SEMANTIC_ATTENTION_CPU_THREADS=2
+```
+
 ## Chat Display Switches
 
 - CHAT_SHOW_SYSTEM_MESSAGES=false:
    hide role=系统 lines in chat window for immersion.
 - CHAT_SHOW_SESSION_DEBUG_MARKER=false:
    show session markers like 桌宠(自动)[S2] only when debugging archive cycle behavior.
+- ENABLE_CHAT_MULTIMODAL=false:
+   initial state of the chat panel's multimodal button. When enabled, each manual message reads the current scan region before replying.
+- CHAT_SCREEN_CONTEXT_MAX_CHARS=1600:
+   maximum screen/OCR context fused into one chat request. Text-rich screens still use the OCR-first token-saving route.
+- SCAN_MONITOR_INDEX=0:
+   scan the complete virtual desktop by default. UI region selection automatically targets the display under the cursor and converts Qt logical pixels to physical capture pixels.
 
 ## Current Capabilities
 
@@ -141,9 +201,16 @@ LIVE2D_FOLLOW_ACTIVATE_DISTANCE_PX=180
 ENABLE_MULTIMODAL_VISION=true
 ENABLE_MM_COMPAT_MODE=true
 ENABLE_MM_SCREEN_COMMENT=true
+ENABLE_OCR_FIRST_ROUTING=true
 MM_TIMEOUT_SEC=5.0
 MM_FAILURE_THRESHOLD=3
 MM_COOLDOWN_SEC=120
+MM_OUTPUT_MAX_TOKENS=220
+MM_AUTO_MIN_INTERVAL_SEC=180
+OCR_ONLY_MIN_CHARS=120
+OCR_ONLY_MIN_CONFIDENCE=0.75
+OCR_HYBRID_MIN_CHARS=30
+OCR_CONTEXT_MAX_CHARS=1200
 SCAN_TICK_INTERVAL_SEC=8
 SCAN_SUBMIT_MIN_INTERVAL_SEC=12
 SCREEN_SCAN_INTERVAL_SEC=45
@@ -180,3 +247,6 @@ AUTO_COMMENT_STYLE_WEIGHTS=陪伴评论:1.2,轻松提问:0.8,俏皮打趣:0.5,�
 - `OCR_CPU_THREADS` is applied directly to RapidOCR init (`intra/inter op threads`); restart app after changing it.
 - You can try GPU OCR path with `OCR_USE_DML=true` (Windows) or `OCR_USE_CUDA=true` when runtime supports it.
 - For unstable vision APIs, keep `ENABLE_MM_COMPAT_MODE=true` to preserve OCR fallback.
+- OCR-first routing uses local OCR for text-rich screens, combines compact OCR with vision for mixed screens, and uses vision alone when OCR is sparse.
+- `MM_AUTO_MIN_INTERVAL_SEC` limits automatic screenshot uploads independently from the local scan interval; manual screen comments bypass this interval.
+- `MM_OUTPUT_MAX_TOKENS` and `OCR_CONTEXT_MAX_CHARS` cap the two variable-size parts of a hybrid vision request.
