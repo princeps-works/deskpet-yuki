@@ -17,6 +17,7 @@ from urllib.request import Request, urlopen
 
 from desktop_pet.config.prompts import INITIAL_PERSONA, get_system_chat_prompt
 from desktop_pet.llm.client import LLMClient
+from desktop_pet.llm.memory_store import MemoryStore
 from desktop_pet.llm.semantic_attention import SemanticAttentionRouter
 
 
@@ -83,6 +84,10 @@ class DialogManager:
             1,
             min(self._long_memory_limit, int(long_memory_context_window)),
         )
+        self._memory_store = MemoryStore(
+            self._memory_path,
+            diary_limit=self._long_memory_limit,
+        )
         self._visual_novel_context_provider = visual_novel_context_provider
         self._visual_novel_planner_context_provider = visual_novel_planner_context_provider
         self._web_source_health: dict[str, dict[str, float]] = {}
@@ -99,99 +104,27 @@ class DialogManager:
         except (TypeError, ValueError):
             return max(0.0, min(1.0, float(default)))
 
-    @classmethod
-    def _normalize_memory_entry(cls, item: object) -> dict[str, object] | None:
-        if not isinstance(item, dict):
-            return None
-        summary = item.get("summary")
-        if not isinstance(summary, str) or not summary.strip():
-            return None
-        timestamp = str(item.get("timestamp") or item.get("created_at") or "").strip()
-        created_at = str(item.get("created_at") or timestamp).strip()
-        freshness = str(item.get("freshness") or "unknown").strip().lower()
-        if freshness not in {"stable", "volatile", "unknown"}:
-            freshness = "unknown"
-        raw_sources = item.get("sources")
-        sources: list[dict[str, object]] = []
-        if isinstance(raw_sources, list):
-            for source in raw_sources[:8]:
-                if not isinstance(source, dict):
-                    continue
-                source_type = str(source.get("type") or "unknown").strip().lower()[:32]
-                normalized_source: dict[str, object] = {"type": source_type or "unknown"}
-                for key in ("reference", "url", "retrieved_at"):
-                    value = str(source.get(key) or "").strip()
-                    if value:
-                        normalized_source[key] = value[:500]
-                if "confidence" in source:
-                    normalized_source["confidence"] = cls._clamp_confidence(source.get("confidence"))
-                sources.append(normalized_source)
-        source_type = str(item.get("source_type") or "").strip().lower()
-        if not source_type:
-            unique_types = {str(source.get("type") or "") for source in sources}
-            source_type = next(iter(unique_types)) if len(unique_types) == 1 else ("mixed" if unique_types else "legacy")
-        topics = item.get("topics")
-        normalized_topics = []
-        if isinstance(topics, list):
-            normalized_topics = [
-                re.sub(r"\s+", " ", str(topic or "")).strip()[:40]
-                for topic in topics[:8]
-                if str(topic or "").strip()
-            ]
-        return {
-            "schema_version": 2,
-            "timestamp": timestamp or created_at,
-            "created_at": created_at or timestamp,
-            "last_verified_at": str(item.get("last_verified_at") or "").strip(),
-            "summary": summary.strip(),
-            "source_type": source_type or "legacy",
-            "sources": sources,
-            "confidence": cls._clamp_confidence(item.get("confidence"), 0.45),
-            "freshness": freshness,
-            "expires_at": str(item.get("expires_at") or "").strip(),
-            "topics": normalized_topics,
-        }
-
     def _load_memory_entries(self) -> list[dict[str, object]]:
-        try:
-            raw = json.loads(self._memory_path.read_text(encoding="utf-8"))
-        except Exception:
-            return []
-        if not isinstance(raw, list):
-            return []
-        entries: list[dict[str, object]] = []
-        for item in raw:
-            normalized = self._normalize_memory_entry(item)
-            if normalized is not None:
-                entries.append(normalized)
-        return entries
+        return self._memory_store.list_diaries()
 
-    def _save_memory_entries(self, entries: list[dict[str, object]]) -> None:
-        self._memory_path.parent.mkdir(parents=True, exist_ok=True)
-        normalized = [item for item in (self._normalize_memory_entry(entry) for entry in entries) if item is not None]
-        self._memory_path.write_text(
-            json.dumps(normalized[-self._long_memory_limit :], ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-
-    def _build_long_memory_block(self) -> str:
-        entries = self._load_memory_entries()
+    def _build_long_memory_block(self, query: str = "") -> str:
+        if str(query or "").strip():
+            entries = self._rank_memory_candidates(query, top_k=6)
+        else:
+            valid = [entry for entry in self._load_memory_entries() if not self._memory_is_expired(entry)]
+            entries = list(reversed(valid[-self._long_memory_context_window :]))
         if not entries:
             return ""
-        # Keep a wider local candidate window while placing newest memories
-        # first. If semantic attention is unavailable, the character-budget
-        # fallback will therefore retain the freshest records.
-        picked = list(reversed(entries[-self._long_memory_context_window :]))
-        lines = [f"- {str(item['summary'])}" for item in picked]
-        return "长期互动记忆要点:\n" + "\n".join(lines)
+        lines = [self._memory_context_line(item) for item in entries]
+        return "与当前问题相关的长期记忆:\n" + "\n".join(lines)
 
     def build_light_long_memory_hint(self, limit: int = 3) -> str:
-        entries = self._load_memory_entries()
+        entries = self._memory_store.candidates("", limit=max(20, limit * 4))
         if not entries:
             return ""
 
         max_items = max(1, limit)
-        picked = entries[-max_items:]
+        picked = entries[:max_items]
         lines = [f"- {str(item['summary'])}" for item in picked]
         return "长期记忆（低权重参考，可忽略）:\n" + "\n".join(lines)
 
@@ -221,6 +154,121 @@ class DialogManager:
             f"freshness={freshness}|state={state}] {summary}"
         )
 
+    @classmethod
+    def _memory_context_line(cls, entry: dict[str, object]) -> str:
+        slot = str(entry.get("slot") or "diary")
+        freshness = str(entry.get("freshness") or "unknown")
+        confidence = cls._clamp_confidence(entry.get("confidence"), 0.45)
+        summary = re.sub(r"\s+", " ", str(entry.get("summary") or "")).strip()
+        return f"- [slot={slot}|confidence={confidence:.2f}|freshness={freshness}] {summary}"
+
+    @classmethod
+    def _memory_lexical_score(cls, query: str, entry: dict[str, object]) -> float:
+        summary = str(entry.get("summary") or "")
+        topics = " ".join(str(topic) for topic in entry.get("topics", []) if str(topic).strip())
+        target = f"{summary} {topics}".strip()
+        query_tokens = cls._tokenize_for_match(query)
+        target_tokens = cls._tokenize_for_match(target)
+        overlap = len(query_tokens & target_tokens) / max(1, len(query_tokens))
+        sequence = SequenceMatcher(
+            None,
+            cls._normalize_match_text(query),
+            cls._normalize_match_text(target),
+        ).ratio()
+        fts_score = cls._clamp_confidence(entry.get("fts_score"), 0.0)
+        return max(fts_score, min(1.0, overlap * 0.72 + sequence * 0.28))
+
+    def _memory_semantic_scores(
+        self,
+        query: str,
+        entries: list[dict[str, object]],
+    ) -> list[float] | None:
+        router = self._semantic_attention
+        if router is None or not entries:
+            return None
+        query_vectors = router.embeddings([query])
+        if query_vectors is None or len(query_vectors) != 1:
+            return None
+        query_vector = query_vectors[0]
+        model_key = router.cache_identity
+        vectors: list[object | None] = []
+        missing_indexes: list[int] = []
+        missing_texts: list[str] = []
+        for index, entry in enumerate(entries):
+            text = str(entry.get("summary") or "")
+            cached = self._memory_store.load_embedding(int(entry.get("id") or 0), model_key, text)
+            vectors.append(cached)
+            if cached is None:
+                missing_indexes.append(index)
+                missing_texts.append(text)
+        if missing_texts:
+            encoded = router.embeddings(missing_texts)
+            if encoded is None or len(encoded) != len(missing_texts):
+                return None
+            for index, vector in zip(missing_indexes, encoded):
+                vectors[index] = vector
+                self._memory_store.save_embedding(
+                    int(entries[index].get("id") or 0),
+                    model_key,
+                    str(entries[index].get("summary") or ""),
+                    vector,
+                )
+        scores: list[float] = []
+        for vector in vectors:
+            if vector is None or getattr(vector, "shape", None) != getattr(query_vector, "shape", None):
+                scores.append(0.0)
+                continue
+            scores.append(max(0.0, min(1.0, float(vector @ query_vector))))
+        return scores
+
+    def _rank_memory_candidates(
+        self,
+        query: str,
+        *,
+        top_k: int,
+    ) -> list[dict[str, object]]:
+        query_text = str(query or "").strip()
+        if not query_text:
+            return self._memory_store.candidates("", limit=max(20, top_k))[: max(1, top_k)]
+        candidates = self._memory_store.candidates(
+            query_text,
+            limit=max(80, self._long_memory_context_window * 3),
+        )
+        if not candidates:
+            return []
+        semantic_scores = self._memory_semantic_scores(query_text, candidates)
+        recall_query = any(marker in query_text for marker in ("记得", "上次", "以前", "之前", "我喜欢", "我的"))
+        total = max(1, len(candidates))
+        ranked: list[tuple[float, dict[str, object]]] = []
+        for index, entry in enumerate(candidates):
+            semantic = semantic_scores[index] if semantic_scores is not None else 0.0
+            lexical = self._memory_lexical_score(query_text, entry)
+            confidence = self._clamp_confidence(entry.get("confidence"), 0.45)
+            importance = self._clamp_confidence(entry.get("importance"), 0.50)
+            recency = 1.0 - index / total
+            score = (
+                0.50 * semantic
+                + 0.25 * lexical
+                + 0.10 * importance
+                + 0.10 * confidence
+                + 0.05 * recency
+            )
+            relevant = semantic >= 0.34 or lexical >= 0.10
+            if recall_query and index < self._long_memory_context_window:
+                relevant = True
+            if relevant:
+                ranked.append((score, entry))
+        ranked.sort(
+            key=lambda item: (
+                -item[0],
+                -int(bool(item[1].get("pinned"))),
+                -int(item[1].get("id") or 0),
+            )
+        )
+        selected = [entry for _, entry in ranked[: max(1, int(top_k))]]
+        self._memory_store.mark_recalled(int(entry.get("id") or 0) for entry in selected)
+        return selected
+
     def _retrieve_long_memory_for_query(
         self,
         query: str,
@@ -228,51 +276,16 @@ class DialogManager:
         max_chars: int = 600,
         top_k: int = 3,
     ) -> tuple[str, str]:
-        entries = self._load_memory_entries()
+        entries = self._rank_memory_candidates(query, top_k=top_k)
         if not entries:
             return "", "memory_prefetch=empty"
 
-        query_text = str(query or "").strip()
         lines = [self._memory_planner_line(entry) for entry in entries]
         budget = max(160, min(1200, int(max_chars)))
-        if self._semantic_attention is not None:
-            result = self._semantic_attention.route(
-                query=query_text,
-                contexts={"memory": "\n".join(lines)},
-                budgets={"memory": budget},
-                source_reliability={"memory": 0.62},
-            )
-            selected = str(result.contexts.get("memory", "") or "").strip()
-            if result.applied and selected:
-                return (
-                    "本地长期记忆候选（仅用于判断是否需要联网，不保证事实仍然最新）:\n" + selected,
-                    "memory_prefetch=semantic;" + result.debug,
-                )
-
-        query_tokens = self._tokenize_for_match(query_text)
-        scored: list[tuple[float, int, str]] = []
-        for index, (entry, line) in enumerate(zip(entries, lines)):
-            summary = str(entry.get("summary") or "")
-            tokens = self._tokenize_for_match(summary)
-            overlap = len(query_tokens & tokens) / max(1, len(query_tokens))
-            similarity = SequenceMatcher(
-                None,
-                self._normalize_match_text(query_text),
-                self._normalize_match_text(summary),
-            ).ratio()
-            confidence = self._clamp_confidence(entry.get("confidence"), 0.45)
-            recency = (index + 1) / max(1, len(entries))
-            score = overlap * 0.55 + similarity * 0.25 + confidence * 0.12 + recency * 0.08
-            if overlap > 0 or similarity >= 0.18:
-                scored.append((score, index, line))
-        scored.sort(key=lambda item: (-item[0], -item[1]))
-        selected_lines = [line for _, _, line in scored[: max(1, int(top_k))]]
-        if not selected_lines:
-            return "", "memory_prefetch=lexical_empty"
-        selected = self._truncate_text("\n".join(selected_lines), budget)
+        selected = self._truncate_text("\n".join(lines), budget)
         return (
             "本地长期记忆候选（仅用于判断是否需要联网，不保证事实仍然最新）:\n" + selected,
-            f"memory_prefetch=lexical;selected={len(selected_lines)}",
+            f"memory_prefetch=hybrid_sqlite;selected={len(entries)}",
         )
 
     def _build_recent_session_block(self) -> str:
@@ -716,11 +729,18 @@ class DialogManager:
             "请把以下本轮互动内容整理为一篇日记体长期记忆，长度50到500字。"
             "要求：保持妹妹口吻、自然有温度；保留关系进展、稳定偏好、重要约定与持续目标；"
             "不记录一次性噪声。不要编造对话中没有出现的事实。"
-            "只输出一个JSON对象，不要Markdown或解释。格式："
+            "同时把值得长期保存的信息拆成原子事实；这只是同一次归档，不要另写解释。"
+            "只输出一个JSON对象，不要Markdown。格式："
             '{"summary":"日记正文","topics":["主题1","主题2"],'
-            '"freshness":"stable或volatile或unknown"}。'
+            '"freshness":"stable或volatile或unknown","facts":['
+            '{"subject":"主体","predicate":"关系或属性","object":"值",'
+            '"slot":"user_profile或relationship或current_state或knowledge",'
+            '"policy":"replace或append","importance":0到1,"confidence":0到1,'
+            '"freshness":"stable或volatile或unknown","pinned":false}]}。'
             "freshness判断：用户偏好、约定、关系和稳定作品设定为stable；"
             "新闻、当前局势、价格、天气、软件版本等易变化事实为volatile；无法确定为unknown。"
+            "current_state默认replace；经历、关系事件和作品知识通常append；"
+            "只有用户明确说请记住、永远记住时才把pinned设为true。最多8条facts。"
         )
         payload: dict[str, object] = {}
         try:
@@ -778,23 +798,22 @@ class DialogManager:
         confidence = self._clamp_confidence(evidence.get("confidence"), 0.45)
         last_verified_at = str(evidence.get("last_verified_at") or "")
 
-        entries = self._load_memory_entries()
-        entries.append(
-            {
-                "schema_version": 2,
-                "timestamp": created_at,
-                "created_at": created_at,
-                "last_verified_at": last_verified_at,
-                "summary": summary,
-                "source_type": source_type,
-                "sources": sources,
-                "confidence": confidence,
-                "freshness": freshness,
-                "expires_at": expires_at,
-                "topics": topics,
-            }
-        )
-        self._save_memory_entries(entries)
+        diary_entry = {
+            "schema_version": 3,
+            "timestamp": created_at,
+            "created_at": created_at,
+            "last_verified_at": last_verified_at,
+            "summary": summary,
+            "source_type": source_type,
+            "sources": sources,
+            "confidence": confidence,
+            "freshness": freshness,
+            "expires_at": expires_at,
+            "topics": topics,
+        }
+        raw_facts = payload.get("facts")
+        facts = raw_facts[:8] if isinstance(raw_facts, list) else []
+        self._memory_store.add_diary(diary_entry, facts)
         return summary
 
     def set_tutor_enabled(self, enabled: bool) -> None:
@@ -2543,7 +2562,7 @@ class DialogManager:
         if not default_greeting:
             default_greeting = "哥哥，欢迎回来，我在这陪你。"
 
-        entries = self._load_memory_entries()
+        entries = [entry for entry in self._load_memory_entries() if not self._memory_is_expired(entry)]
         if not entries:
             return default_greeting
 
@@ -2587,11 +2606,12 @@ class DialogManager:
         if entries and entries[-1].get("summary", "") == text:
             return False
 
-        entries.append(
+        created_at = self._now_iso()
+        self._memory_store.add_diary(
             {
-                "schema_version": 2,
-                "timestamp": self._now_iso(),
-                "created_at": self._now_iso(),
+                "schema_version": 3,
+                "timestamp": created_at,
+                "created_at": created_at,
                 "last_verified_at": "",
                 "summary": text,
                 "source_type": "manual",
@@ -2602,7 +2622,6 @@ class DialogManager:
                 "topics": [],
             }
         )
-        self._save_memory_entries(entries)
         return True
 
     def end_current_chat(self) -> str:
@@ -2618,7 +2637,7 @@ class DialogManager:
         extra_context_max_chars: int | None = None,
         prepared_web_search: tuple[str, str] | None = None,
     ) -> str:
-        long_memory = self._build_long_memory_block()
+        long_memory = self._build_long_memory_block(user_text)
         recent_session = self._build_recent_session_block()
         visual_novel_context = ""
         if callable(self._visual_novel_context_provider):

@@ -8,6 +8,9 @@ assets/models/bge-small-zh-v1.5-onnx/
 stanza_resources/
 
 data/chat_long_memory.json
+data/chat_long_memory.sqlite3
+data/chat_long_memory.sqlite3-shm
+data/chat_long_memory.sqlite3-wal
 data/live2d_py_*.json
 data/live2d_py_*.log
 data/visual_novel_story.json

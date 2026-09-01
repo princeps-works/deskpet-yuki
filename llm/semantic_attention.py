@@ -81,6 +81,10 @@ class OnnxTextEncoder:
     def status(self) -> str:
         return self._status
 
+    @property
+    def identity(self) -> str:
+        return f"onnx:{self._model_path.resolve()}:{self._max_length}"
+
     def _find_model_file(self) -> Path | None:
         candidates = (
             self._model_path / "onnx" / "model_quantized.onnx",
@@ -225,6 +229,11 @@ class SemanticAttentionRouter:
         self._disabled_reason = ""
 
     @property
+    def cache_identity(self) -> str:
+        identity = getattr(self._encoder, "identity", "")
+        return str(identity or f"{type(self._encoder).__module__}.{type(self._encoder).__qualname__}")
+
+    @property
     def status(self) -> str:
         if not self.enabled:
             return "disabled"
@@ -257,16 +266,25 @@ class SemanticAttentionRouter:
         normalized_texts = [self._normalize_text(text) for text in texts]
         if not self.enabled or not normalized_query or not normalized_texts or any(not text for text in normalized_texts):
             return None
+        vectors = self.embeddings([normalized_query, *normalized_texts])
+        if vectors is None:
+            return None
+        return [
+            max(0.0, min(1.0, float(vector @ vectors[0])))
+            for vector in vectors[1:]
+        ]
+
+    def embeddings(self, texts: list[str]) -> np.ndarray | None:
+        """Return normalized local vectors without forcing a cold model load."""
+        normalized = [self._normalize_text(text) for text in texts]
+        if not self.enabled or not normalized or any(not text for text in normalized):
+            return None
         # The desktop UI warms the encoder in a background thread. Do not make
-        # the first visual-novel scan block on the model's cold start.
+        # the first visual-novel scan or chat block on the model's cold start.
         if self._encoder.status == "not_loaded":
             return None
         try:
-            vectors = self._encode_cached([normalized_query, *normalized_texts])
-            return [
-                max(0.0, min(1.0, float(vector @ vectors[0])))
-                for vector in vectors[1:]
-            ]
+            return self._encode_cached(normalized)
         except Exception as exc:
             detail = re.sub(r"\s+", " ", str(exc)).strip()[:140]
             self._disabled_reason = f"unavailable:{type(exc).__name__}:{detail}"
