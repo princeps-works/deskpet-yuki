@@ -1,13 +1,18 @@
 .env
+.env.*
+!.env.example
 .vscode/
 __pycache__/
 *.py[cod]
 
 assets/models/m2m100_418M_ct2/
+assets/models/index_translate_2b/
+tools/llama_cpp/
 assets/models/bge-small-zh-v1.5-onnx/
 stanza_resources/
 
 data/chat_long_memory.json
+data/personalization.json
 data/chat_long_memory.sqlite3
 data/chat_long_memory.sqlite3-shm
 data/chat_long_memory.sqlite3-wal
@@ -17,5 +22,12 @@ data/visual_novel_story.json
 data/tts_translation_cache.json
 data/tts_translation_cache.json.tmp
 data/visual_novel_stories/
+
+# Local runtime state, recordings, diagnostics, and rollback snapshots.
+data/*
+!data/*.py
+!data/persona_initial.json
+data/_*.py
+scripts/_*.py
 
 皮套/**/runtime/live2d_runtime_*.model3.json

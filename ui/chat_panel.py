@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import io
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Callable, Optional
@@ -181,7 +182,7 @@ class ChatPanel(QWidget):
 
     def enable_live2d_overlay_mode(self):
         self.overlay_mode = True
-        self.setWindowFlags(Qt.WindowType.Window)
+        self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
         self.resize(460, 700)
         self.setStyleSheet(
@@ -663,7 +664,17 @@ class ChatPanel(QWidget):
         self.diary_window.activateWindow()
 
     def show_and_focus(self):
-        self.show()
+        if self.isMinimized():
+            self.showNormal()
+        else:
+            self.show()
+        # A hidden Windows launch can suppress the first native ShowWindow call
+        # while Qt already considers the widget visible. Reset that state once.
+        if hasattr(ctypes, "windll") and not ctypes.windll.user32.IsWindowVisible(
+            ctypes.c_void_p(int(self.winId()))
+        ):
+            self.hide()
+            self.show()
         self.raise_()
         self.activateWindow()
         self.input_line.setFocus(Qt.FocusReason.ActiveWindowFocusReason)

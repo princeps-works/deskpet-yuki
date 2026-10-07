@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import os
 import random
@@ -173,6 +174,68 @@ def _read_target_rect() -> tuple[int, int, int, int] | None:
         return None
 
 
+def _suppress_windows_fault_dialogs() -> None:
+    """Stop Windows from showing a modal crash dialog when the SDK faults.
+
+    A native access violation inside the Cubism/GL layer would otherwise pop up
+    ``0x00000000 指令引用了 0x00000000 内存`` and block the desktop until the
+    user clicks it. Suppressed here, the process simply exits with a non-zero
+    code and the host-side watchdog can restart it.
+    """
+    if not hasattr(ctypes, "windll"):  # pragma: no cover - non-Windows
+        return
+    try:
+        SEM_FAILCRITICALERRORS = 0x0001
+        SEM_NOGPFAULTERRORBOX = 0x0002
+        SEM_NOOPENFILEERRORBOX = 0x8000
+        ctypes.windll.kernel32.SetErrorMode(
+            SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX
+        )
+    except Exception:
+        pass
+
+
+# Shutdown marker handshake ---------------------------------------------------
+# The host asks for a graceful shutdown through the same state files it already
+# writes, so the renderer can dispose the model and quit pygame instead of being
+# force-killed (which tears down native GL/Cubism state mid-frame).
+_SHUTDOWN_MARKER_FILES = ("live2d_py_target_rect.json", "live2d_py_input_state.json")
+_SHUTDOWN_STALENESS_SEC = 3.0
+
+
+def _shutdown_requested() -> bool:
+    base = Path(__file__).resolve().parent.parent / "data"
+    now = time.time()
+    for name in _SHUTDOWN_MARKER_FILES:
+        try:
+            data_path = base / name
+            if not data_path.exists():
+                continue
+            data = json.loads(data_path.read_text(encoding="utf-8"))
+            if not int(data.get("shutdown", 0)):
+                continue
+            stamp = float(data.get("shutdown_ts", 0.0) or 0.0)
+            if stamp > 0.0 and (now - stamp) > _SHUTDOWN_STALENESS_SEC:
+                # Stale marker from a previous session: ignore it.
+                continue
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _write_shutdown_ack(pid: int) -> None:
+    try:
+        state_path = Path(__file__).resolve().parent.parent / "data" / "live2d_py_shutdown_ack.json"
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text(
+            json.dumps({"pid": int(pid), "ts": time.time()}),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
 def _read_input_state() -> dict | None:
     candidates = [
         Path(__file__).resolve().parent.parent / "data" / "live2d_py_input_state.json",
@@ -251,6 +314,7 @@ def _prepare_model_json_for_runtime(model_path: Path) -> tuple[Path, dict[str, i
 
 def run() -> int:
     try:
+        _suppress_windows_fault_dialogs()
         _install_log_filters()
         _log_line("[LIVE2D-PY] runner start")
         args = _parse_args()
@@ -262,7 +326,7 @@ def run() -> int:
         import pygame
         import live2d.v3 as live2d
         from pygame.locals import DOUBLEBUF, NOFRAME, OPENGL
-        from OpenGL.GL import GL_TEXTURE_2D, glEnable
+        from OpenGL.GL import GL_TEXTURE_2D, glEnable, glViewport
 
         if hasattr(live2d, "setLogEnable"):
             live2d.setLogEnable(False)
@@ -468,6 +532,15 @@ def run() -> int:
         cached_input_state = None
         next_input_read_ts = 0.0
         while running:
+            if _shutdown_requested():
+                _log_line("[LIVE2D-PY] shutdown requested by host, exiting cleanly")
+                try:
+                    _write_shutdown_ack(os.getpid())
+                except Exception:
+                    pass
+                running = False
+                break
+
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
@@ -528,6 +601,16 @@ def run() -> int:
             local_h = None
             now_ts = time.time()
             if now_ts >= next_input_read_ts:
+                # Native host resizing (including monitor DPI changes) does not
+                # recreate SDL's GL context. Match the viewport to its client area.
+                if win_hwnd and win_user32 and rect_type is not None:
+                    client_rect = rect_type()
+                    if win_user32.GetClientRect(win_hwnd, client_rect):
+                        size = (int(client_rect.right), int(client_rect.bottom))
+                        if min(size) > 0 and size != screen_size:
+                            screen_size = size
+                            glViewport(0, 0, *size)
+                            _safe_call(model, "Resize", *size)
                 cached_input_state = _read_input_state()
                 scan_busy_flag = bool(cached_input_state and cached_input_state.get("scan_busy", 0))
                 # Poll slower during scan_busy to reduce disk IO contention.

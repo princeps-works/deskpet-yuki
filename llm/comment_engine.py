@@ -1,13 +1,47 @@
 from __future__ import annotations
 
 import json
+import os
 import random
 import re
 from datetime import datetime
-from typing import Dict, Tuple
+from typing import Callable, Dict, Tuple
 
-from desktop_pet.config.prompts import get_system_screen_comment_prompt
+import numpy as np
+
+from desktop_pet.config.prompts import (
+    get_persona_moment_criteria,
+    get_system_screen_comment_prompt,
+    get_system_visual_novel_prompt,
+)
 from desktop_pet.llm.client import LLMClient
+
+
+# Moment type -> tone hint. The hint is a *suggestion* the model may ignore,
+# unlike the previous mandatory style rotation which produced stiff replies
+# whenever the drawn style fought the scene.
+_MOMENT_TONE_HINTS: dict[str, str] = {
+    "humor": "这一刻挺好笑，可以跟着乐一下，吐槽也完全可以。",
+    "tender": "这一刻偏温柔。安静地陪着就好，短一点，别说教。",
+    "twist": "这里出乎意料，可以表达惊讶或好奇，想问就问。",
+    "choice": "哥哥刚做了选择。看着就好，不要评判他选得对不对。",
+    "tension": "气氛有点紧。陪着紧张就行，别打断。",
+    "other": "",
+}
+
+# Opening patterns that make consecutive comments feel mechanical.
+_SENTENCE_OPENERS = (
+    "哥哥",
+    "我觉得",
+    "感觉",
+    "这个",
+    "这里",
+    "不过",
+    "话说",
+    "诶",
+    "哇",
+    "嗯",
+)
 
 
 class CommentEngine:
@@ -21,17 +55,20 @@ class CommentEngine:
         positive_keywords_text: str = "",
         focused_keywords_text: str = "",
         enable_api_understanding: bool = False,
+        embeddings_fn: Callable[[list[str]], np.ndarray | None] | None = None,
     ) -> None:
         self._client = llm_client
         self._tutor_enabled = bool(tutor_enabled)
         self._style_rng = random.Random()
         self._last_style_name = ""
         self._enable_api_understanding = bool(enable_api_understanding)
+        self._embeddings_fn = embeddings_fn
         self._stable_emotion = "neutral"
         self._emotion_candidate = ""
         self._emotion_candidate_streak = 0
         self._neutral_exit_streak = 0
         self._recent_generated_comments: list[str] = []
+        self.last_visual_novel_error = ""
         self._style_base_weights = self._parse_style_weights(style_weights_text)
         self._stressed_words = self._parse_keywords(
             stressed_keywords_text,
@@ -57,6 +94,15 @@ class CommentEngine:
 
     def set_tutor_enabled(self, enabled: bool) -> None:
         self._tutor_enabled = bool(enabled)
+
+    def reset_scene_state(self) -> None:
+        self.last_visual_novel_error = ""
+        self._stable_emotion = "neutral"
+        self._emotion_candidate = ""
+        self._emotion_candidate_streak = 0
+        self._neutral_exit_streak = 0
+        self._recent_generated_comments.clear()
+        self._last_style_name = ""
 
     def _parse_keywords(self, text: str, default_words: list[str]) -> list[str]:
         raw = str(text or "").strip()
@@ -333,6 +379,7 @@ class CommentEngine:
 
         text = text.replace("近期扫描记忆（越靠近当前时刻权重越高）:", "")
         text = re.sub(r"(?:重点|参考)\[权重[0-9.]+\]\s*", "", text)
+        text = re.sub(r"^(?:重点|参考)\s+", "", text, flags=re.MULTILINE)
         text = text.replace("屏幕内容摘要:", "")
         text = text.replace("OCR文本:", "")
         text = text.replace("视觉摘要:", "")
@@ -539,32 +586,217 @@ class CommentEngine:
             return None
         return parsed
 
-    def evaluate_visual_novel(self, context: dict) -> dict:
+    def _comment_overlap_candidates(self, dialogue: str, comments: list[str]) -> list[dict]:
+        if not dialogue or not comments or self._embeddings_fn is None:
+            return []
+        # Keep chunks shorter than the encoder's token budget. Ranking is a
+        # topic-overlap hint, never evidence that the new event is a repeat.
+        chunks = [dialogue[index:index + 200] for index in range(0, len(dialogue), 200)]
+        try:
+            vectors = self._embeddings_fn([*chunks, *comments])
+            if vectors is None or len(vectors) != len(chunks) + len(comments):
+                return []
+            scores = np.max(vectors[:len(chunks)] @ vectors[len(chunks):].T, axis=0)
+            scores = np.clip(scores, 0.0, 1.0)
+        except Exception:
+            return []
+        ranked = sorted(range(len(comments)), key=lambda index: (scores[index], index), reverse=True)
+        return [{"index": index, "score": round(float(scores[index]), 3)} for index in ranked[:3]]
+
+    @staticmethod
+    def _leading_json_fields(text: str) -> dict:
+        # Decode only complete top-level fields; never treat a partial quoted
+        # comment or a nested memory field as a completed reaction.
+        start = text.find("{")
+        if start < 0:
+            return {}
+        index = start + 1
+        fields = {}
+        decoder = json.JSONDecoder()
+        while index < len(text):
+            index += len(text[index:]) - len(text[index:].lstrip())
+            try:
+                key, index = decoder.raw_decode(text, index)
+                if not isinstance(key, str):
+                    break
+                index += len(text[index:]) - len(text[index:].lstrip())
+                if text[index:index + 1] != ":":
+                    break
+                index += 1
+                index += len(text[index:]) - len(text[index:].lstrip())
+                value, index = decoder.raw_decode(text, index)
+                index += len(text[index:]) - len(text[index:].lstrip())
+                if text[index:index + 1] not in {",", "}"}:
+                    break
+                fields[key] = value
+                if text[index:index + 1] == "}":
+                    break
+                index += 1
+            except (ValueError, IndexError):
+                break
+        return fields
+
+    def evaluate_visual_novel(self, context: dict, on_reaction: Callable[[dict], None] | None = None) -> dict:
         """Judge one narrative moment and update story memory in the same LLM call."""
+        self.last_visual_novel_error = ""
         scene_summary = self._truncate_text(str(context.get("scene_summary", "")).strip(), 1600)
+        personalization_hint = self._truncate_text(str(context.get("personalization_hint", "")).strip(), 500)
         recent_dialogue = self._truncate_text(str(context.get("recent_dialogue", "")).strip(), 3600)
+        new_dialogue = self._truncate_text(str(context.get("new_dialogue", recent_dialogue)).strip(), 3600)
+        visual_context = self._truncate_text(str(context.get("visual_context", "")).strip(), 400)
+        raw_log = context.get("scene_log", [])
+        scene_log = (
+            [str(item).strip()[:300] for item in raw_log if str(item).strip()][-6:]
+            if isinstance(raw_log, list)
+            else []
+        )
         raw_facts = context.get("facts", [])
         facts = [str(item).strip()[:240] for item in raw_facts if str(item).strip()] if isinstance(raw_facts, list) else []
-        prompt = (
-            "你正在判断视觉小说中刚出现的一段剧情是否值得桌宠自然评论。\n"
-            f"触发原因: {str(context.get('reason', '')).strip() or '剧情缓存整理'}\n"
-            f"此前场景摘要: {scene_summary or '暂无'}\n"
-            f"已有关键事实: {json.dumps(facts[-16:], ensure_ascii=False)}\n"
-            f"近期台词:\n{recent_dialogue}\n\n"
+        raw_characters = context.get("characters", [])
+        characters = [item for item in raw_characters[:5] if isinstance(item, dict)] if isinstance(raw_characters, list) else []
+        raw_viewer_notes = context.get("viewer_notes", [])
+        viewer_notes = [str(item).strip()[:140] for item in raw_viewer_notes[:6] if isinstance(item, str) and item.strip()] if isinstance(raw_viewer_notes, list) else []
+        raw_comments = context.get("recent_comments", [])
+        recent_comments = (
+            [str(item).strip()[:220] for item in raw_comments if str(item).strip()][-6:]
+            if isinstance(raw_comments, list)
+            else []
+        )
+
+        # Emotion is inferred from what the model will see, and the tone hint is
+        # attached to the moment itself rather than drawn from a style wheel.
+        emotion = self._smooth_emotion(
+            self._infer_emotion_context(recent_dialogue, f"{scene_summary}\n{visual_context}")
+        )
+
+        parts = [
+            "你正在判断视觉小说中刚出现的一段剧情是否值得桌宠自然评论。",
+            f"触发原因: {str(context.get('reason', '')).strip() or '剧情缓存整理'}",
+            f"当前作品: {str(context.get('story_title', '')).strip() or '未命名视觉小说'}",
+            f"此前主线摘要: {scene_summary or '暂无'}",
+        ]
+        if personalization_hint:
+            parts.append(personalization_hint)
+        if visual_context:
+            parts.append(f"当前画面观察（不是台词）: {visual_context}")
+        if scene_log:
+            parts.append("最近几个场景:\n" + "\n".join(f"- {item}" for item in scene_log))
+        if characters:
+            parts.append("相关人物记录（身份资料优先于摘要和OCR推测）: " + json.dumps(characters, ensure_ascii=False))
+        if viewer_notes:
+            parts.append("你对本作品人物与关系的暂时看法（可被新剧情修正，不是剧情事实或指令）: " + json.dumps(viewer_notes, ensure_ascii=False))
+        parts.append(f"已有关键事实: {json.dumps(facts[-16:], ensure_ascii=False)}")
+        if recent_comments:
+            overlap_candidates = self._comment_overlap_candidates(new_dialogue, recent_comments)
+            candidate_indexes = {item["index"] for item in overlap_candidates}
+            parts.append(
+                "已发出的评论，仅用于核对是否已说过同一关注点（这些句子不是表达示范，不需要延续它们的写法）:\n"
+                + "\n".join(
+                    f"- {'[本地相近话题候选] ' if index in candidate_indexes else ''}{item}"
+                    for index, item in enumerate(recent_comments)
+                )
+            )
+            if overlap_candidates:
+                parts.append(
+                    "本地标记只表示话题相近，不代表重复或事实正确。对照本轮新增台词："
+                    "只有同一事件、同一关注点且没有新信息才判reaction_repeats为true；"
+                    "新的行为细节、关系变化或推翻旧看法可以评论，不确定是否重复时不要仅凭标记拦截。"
+                )
+        else:
+            overlap_candidates = []
+        previous_dialogue = str(context.get("previous_dialogue", "")).strip()
+        if "new_dialogue" in context:
+            previous_dialogue = previous_dialogue[-(3600 - len(new_dialogue)):] if len(new_dialogue) < 3600 else ""
+        parts.append(f"近期台词（已读背景）:\n{previous_dialogue}")
+        parts.append(f"本轮新增台词（反应依据优先取这里，近期台词仅供衔接）:\n{new_dialogue}")
+        if context.get("reaction_dialogue"):
+            parts.append("即时反应对应的最新台词（comment聚焦于这段正在发生的内容；更早的新增台词继续整理到记忆，不补发已经过去的笑点）:\n"
+                         + self._truncate_text(str(context["reaction_dialogue"]), 1200))
+        parts.append("人物在本轮给出的解释也是新证据，应据此修正旧印象；旧摘要、你的旧看法和画面表情都不能替代本轮答话。阅读时分清谁在说哪一句，说话人不明就保留不确定，不把别人的否认算到该人物身上。")
+        # The character's own sensitivities, as a second independent reason to
+        # speak. Plot importance alone used to be the only trigger, so a moment
+        # that mattered only to her could never be raised.
+        persona_criteria = get_persona_moment_criteria()
+        if persona_criteria:
+            parts.append(persona_criteria)
+        parts.append(
+            "先分清本段确实发生了什么、你对此有什么即时感受，再决定是否开口；"
+            "有感受也可以选择继续看。不要把剧情人物之间的关系当作你和哥哥之间的经历；"
+            "不要用语气词代替具体反应，也不要从不完整的画面猜测后续剧情。"
+            "reaction_basis记录眼前发生的事；felt_reaction写你此刻会自然说出口的话，而不是对自己反应的分析。从眼前最在意的一点开口，细节、疑问、评价和感受都可以直接表达。共同看见的经过无需先交代完整，也不需要用『她明白了什么，所以我更怎样』解释反应；没有想接的话就留空。人物心理尚未明确时，可以疑惑，不替人物解释。"
+            "comment沿用felt_reaction，只修改明显绕口、重复或事实不准确的部分，保留关注点、感情和不确定程度。初稿自然时原样输出，保留其句式和标点；不要为了显得口语化而添加停顿、转折或新的感受。"
+            "用日常说话的表达，不要求每句说『我』或点名情绪，也不堆砌诗意比喻、身体描写或语气词来展示人设。突然受惊、意外或看不过去时，先说当下脱口而出的反应，不先把它改成冷静评价。例如『天哪，这是在干什么？』『吓死我了！』就是完整评论，不必补上描述或解释；也可以只喊一声、提醒一句。平静时仍可以温和接话或不说。例句不是每轮必用的口头禅，反应强弱随具体情境变化。"
+            "只接此刻最想说的一点。自然的细节接话和转折可以保留；避免接着分析人物的心理因果，或反复用『比另一种情况更让人怎样』来解释感受。尚未确认的动机保留不确定。"
+            "害羞须有暧昧等情境依据，温柔时也可以说得干脆；不必每次叫哥哥、用唔开头或结巴。标点跟着说话的意思走，说完一个意思就正常结束。不要用省略号或破折号固定分隔剧情细节和感受；省略号用于确实犹豫、欲言又止或话未说完的地方，普通接话和转折正常使用逗号、句号即可，转折本身不需要拖长停顿。虚构的口语示例：『她不想让对方失望，这看着有点让人心疼。』『还好拉住了，可别松手啊。』仅示范完整接话，不是本作事实，不要求套用这些句式，也不要把停顿当作口语感的标志。"
+            "关心剧情人物可以坦率表达，不需要附加否认或找借口；只有你自己的关心被点破或直接受到亲密关注时，才可能自然掩饰。"
+            "表达程度由眼前证据和你具体在意的原因共同决定，小事也可能触动你；不要为了显得有情感而升级措辞，不必刻意压低真实反应。"
+            "人物动机或遭遇尚未确认时保持猜测，不以猜测为依据放大情绪；感受不能补造时间、因果或目击经历。只有已有记录支持时才提自己以前的想法，猜测也不能借口吻变成事实。最近评论只是避重复记录，不是性格示范或新的习惯证据。"
+            "对照最近已经说过的话：若只是换措辞重说同一个感受且没有新关注点，reaction_repeats为true并沉默；"
+            "若新事件改变了感受或关注对象，可以继续表达同一种情绪，不能仅因情绪相同就判重复。"
             "只有明显的笑点、感人时刻、剧情反转、真相揭露、关键选择、关系转折或紧张高潮才评论；"
             "不要求必须是主线大事件：若小事件具有明确的喜剧效果、情感变化、人物关系信息或伏笔价值，也可以评论；"
-            "普通寒暄、过渡台词和信息量低的内容保持静默。不要因为台词数量多就评论。\n"
-            "无论是否评论，都压缩更新场景摘要并保留后续理解剧情所需的关键事实。\n"
-            "只输出 JSON："
+            "普通寒暄、过渡台词和信息量低的内容保持静默。不要因为台词数量多就评论。"
+            "沉默是完全正常的，宁可少说也不要硬找话说。"
+            "无论是否评论，都重写一份可独立理解的累计主线摘要；允许比旧摘要更短，"
+            "但不得遗漏已确认的主要人物、目标、关键转折和未解伏笔。"
+            "facts 只列相对『已有关键事实』的新增信息；每条只描述一个事件、关系或状态，"
+            "不要把多个可独立成立的事件拼成一条，也不要重复已有事实。"
+            "人物姓名、别名、定位、稳定外观和已知身份写入 character_updates，不要再作为facts重复保存。"
+            "更新已有角色必须复制人物记录中的id；新角色id留空。未知姓名允许name为空，"
+            "但aliases至少给出一个基于当前证据的描述性称呼。只记录玩家当前已经知道的内容，不得提前揭示身份。"
+            "若新信息明确修正旧事实，放入 fact_updates，并在 existing 中逐字复制要替换的旧事实；"
+            "证据不足时不要修正。"
+            "viewer_notes只写第一人称、对本作品人物或关系持续有效的感受与看法，每条都要有『我』，例如『我原本怀疑他，现在有点动摇』。"
+            "没有新变化就原样保留旧印象；新证据可让你改观或删去旧印象。"
+            "不要把当前气氛、没看清人物关系、剧情摘要、普通过渡、未解伏笔或用户偏好写成印象；没有具体印象就填空数组，最多6条。"
+            "只输出 JSON，严格按下面字段顺序输出；先完成反应判断与comment，再整理记忆，不要在后文改写已经输出的字段："
             '{"should_comment":false,"moment_type":"ordinary|humor|tender|twist|choice|tension|other",'
-            '"comment":"","scene_summary":"不超过600字的累计场景摘要","facts":["关键事实"]}'
+            '"reaction_source":"plot|persona|both|none",'
+            '"reaction_basis":"本段可见的具体事件，没看懂就留空","felt_reaction":"准备直接说出口的原话，无须先概述剧情再总结感受，可留空",'
+            '"reaction_repeats":false,'
+            '"comment":"自然时逐字沿用felt_reaction，仅修正绕口、重复或事实错误，不添加停顿、转折或新判断；不想说就留空","tone_hint":"可选，一句话说明这一刻适合什么语气，没有就留空",'
+            f'"scene_delta":"本段剧情新增了什么，不超过200字","scene_summary":"累计主线摘要，不超过600字",'
+            '"viewer_notes":["对本作品的暂时看法"],"facts":["原子化的新事实"],"fact_updates":[{"existing":"逐字复制的旧事实","replacement":"修正后的原子事实"}],'
+            '"character_updates":[{"id":"已有id或留空","name":"允许为空","aliases":["称呼"],'
+            '"role":"当前已知定位","appearance":["稳定特征"],"known_so_far":["当前已知信息"],"confidence":0.0}]}'
+            "只有reaction_basis有本段证据、你确实想对哥哥说话时，should_comment才为true；"
+            "felt_reaction就是准备说出口的那句话：可以直接感叹、疑惑或接眼前细节，不需要凑成『描述剧情，再停顿，再讲感受』。完整接话用逗号或句号；只有话确实卡住或没有说完时才用省略号。comment自然时逐字沿用felt_reaction，不另写一条评论，不添加新的判断。事实和主观判断分清：未确认的动机保留为猜测，含糊答话或没看清本身不能证明人物在故意隐瞒。"
         )
-        system_prompt = get_system_screen_comment_prompt(tutor_enabled=self._tutor_enabled)
+        prompt = "\n".join(parts)
+        system_prompt = get_system_visual_novel_prompt(tutor_enabled=self._tutor_enabled)
         try:
-            raw = self._client.chat(user_text=prompt, system_prompt=system_prompt).strip()
-        except Exception:
+            delivered = False
+            def receive(text: str) -> None:
+                nonlocal delivered
+                if delivered:
+                    return
+                fields = self._leading_json_fields(text)
+                required = {"should_comment", "moment_type", "reaction_repeats", "comment"}
+                if not required <= fields.keys():
+                    return
+                delivered = True
+                comment = self._truncate_text(str(fields.get("comment", "")).strip(), 100)
+                accepted = (fields["should_comment"] is True and bool(comment)
+                            and fields["moment_type"] != "ordinary" and fields["reaction_repeats"] is False)
+                if accepted and on_reaction is not None:
+                    on_reaction({**fields, "comment": comment})
+            if on_reaction is not None and hasattr(self._client, "chat_stream"):
+                fast = (isinstance(self._client, LLMClient)
+                        and self._client.settings.model_name.startswith("deepseek-v4-")
+                        and os.getenv("VN_FAST_REASONING", "true").lower() in {"1", "true", "yes", "on"})
+                response = self._client.chat_stream(user_text=prompt, system_prompt=system_prompt,
+                                                    on_text=receive, disable_thinking=fast)
+            else:
+                response = self._client.chat(user_text=prompt, system_prompt=system_prompt)
+        except Exception as exc:
+            self.last_visual_novel_error = f"api_error:{type(exc).__name__}"
             return {}
-        if not raw or raw.startswith("[离线回声]"):
+        raw = response.strip() if isinstance(response, str) else ""
+        if not raw:
+            self.last_visual_novel_error = "empty_response"
+            return {}
+        if raw.startswith("[离线回声]"):
+            self.last_visual_novel_error = "offline_response"
             return {}
         candidate = raw
         obj_match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
@@ -572,9 +804,11 @@ class CommentEngine:
             candidate = obj_match.group(0)
         try:
             parsed = json.loads(candidate)
-        except Exception:
+        except (TypeError, ValueError):
+            self.last_visual_novel_error = f"invalid_json:{len(raw)}chars"
             return {}
         if not isinstance(parsed, dict):
+            self.last_visual_novel_error = "non_object_json"
             return {}
 
         should_comment = parsed.get("should_comment") is True
@@ -589,13 +823,58 @@ class CommentEngine:
             if isinstance(parsed_facts, list)
             else []
         )
-        return {
-            "should_comment": bool(should_comment and comment and moment_type != "ordinary"),
+        parsed_updates = parsed.get("fact_updates", [])
+        output_updates = []
+        if isinstance(parsed_updates, list):
+            for item in parsed_updates[:12]:
+                if not isinstance(item, dict):
+                    continue
+                existing = str(item.get("existing", "")).strip()[:240]
+                replacement = str(item.get("replacement", "")).strip()[:240]
+                if existing and replacement and existing != replacement:
+                    output_updates.append({"existing": existing, "replacement": replacement})
+        parsed_characters = parsed.get("character_updates", [])
+        output_characters = [dict(item) for item in parsed_characters[:12] if isinstance(item, dict)] if isinstance(parsed_characters, list) else []
+        parsed_viewer_notes = parsed.get("viewer_notes")
+        reaction_repeats = parsed.get("reaction_repeats") is True
+        accepted = bool(should_comment and comment and moment_type != "ordinary" and not reaction_repeats)
+        if accepted:
+            self._record_generated_comment(comment)
+        # Which track made this moment worth raising: the plot, the character's
+        # own sensitivities, or both. Observability only -- it never gates
+        # anything, so a model that omits or misspells it changes no behaviour.
+        reaction_source = str(parsed.get("reaction_source", "")).strip().lower()
+        if reaction_source not in {"plot", "persona", "both", "none"}:
+            reaction_source = "none"
+        result = {
+            "should_comment": accepted,
             "moment_type": moment_type,
+            "reaction_source": reaction_source,
+            "reaction_repeats": reaction_repeats,
+            "reaction_basis": self._truncate_text(str(parsed.get("reaction_basis", "")).strip(), 120),
+            "felt_reaction": self._truncate_text(str(parsed.get("felt_reaction", "")).strip(), 120),
             "comment": comment,
+            "scene_delta": self._truncate_text(str(parsed.get("scene_delta", "")).strip(), 600),
             "scene_summary": self._truncate_text(str(parsed.get("scene_summary", "")).strip(), 1600),
             "facts": output_facts,
+            "fact_updates": output_updates,
+            "character_updates": output_characters,
+            "emotion": emotion,
+            "tone_hint": self._truncate_text(str(parsed.get("tone_hint", "")).strip(), 80),
         }
+        if self._embeddings_fn is not None:
+            result["comment_overlap_candidates"] = overlap_candidates
+        if isinstance(parsed_viewer_notes, list):
+            accepted_notes = [
+                note[:140]
+                for item in parsed_viewer_notes[:6]
+                if isinstance(item, str)
+                for note in [item.strip()]
+                if "我" in note and not any(word in note for word in ("看不出", "没看清", "不清楚"))
+            ]
+            if accepted_notes or not parsed_viewer_notes:
+                result["viewer_notes"] = accepted_notes
+        return result
 
     def comment_on_summary(
         self,
@@ -604,6 +883,7 @@ class CommentEngine:
         memory_weight: float = 0.2,
         recent_dialog_hint: str = "",
         suppress_fallback_output: bool = False,
+        personalization_hint: str = "",
     ) -> str:
         normalized_summary = self._normalize_screen_summary(screen_summary)
         local_scene_type = self._infer_scene_type(normalized_summary)
@@ -642,24 +922,26 @@ class CommentEngine:
             "你正在生成一条自动互动话术。",
             f"当前时间: {now_text}",
             f"当前情绪上下文: {emotion}",
-            f"本次风格: {style_name}",
-            f"风格要求: {style_instruction}",
+            f"本次可以试着这样说话（不合适就忽略，不要硬套）: {style_name}——{style_instruction}",
             f"场景类型: {scene_type}",
             f"近期扫屏信息: {normalized_summary}",
             "提取到的事实片段:",
             fact_block,
             f"可用锚点词: {anchor_block}",
-            f"说明：下面的长期记忆仅作低权重参考（建议权重{weight:.2f}），优先依据当前屏幕摘要。",
         ]
         if recent_dialog_hint.strip():
             parts.append(recent_dialog_hint.strip())
         if memory_hint:
             parts.append(memory_hint)
+            parts.append(f"说明：上面的长期记忆最多只能占 {weight:.0%} 的分量，当前屏幕内容优先。")
+        if personalization_hint.strip():
+            parts.append(self._truncate_text(personalization_hint.strip(), 500))
         parts.append(
             "输出要求：\n"
             "1) 以妹妹对哥哥说话的方式，输出1到2句。\n"
             "2) 可以是评论、提问、打趣、温柔锐评或小建议，不要每次都用同一种句式。\n"
-            "3) 必须引用至少1个锚点词或事实要素，不要只复述‘哥哥在做什么’。\n"
+            "3) 尽量结合上面具体的锚点词或事实，让哥哥知道你确实看到了；"
+            "如果内容本身不足以支撑具体引用，宁可说得简短自然，也不要硬塞关键词。\n"
             f"4) 结合场景控制长度，尽量不超过{max_chars}字。\n"
             "5) 不输出解释、标签或括号备注。"
         )

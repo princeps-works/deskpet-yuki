@@ -11,6 +11,7 @@ import tempfile
 import time
 from html import escape
 from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable, Optional
 from urllib.parse import urlencode
@@ -39,6 +40,9 @@ except Exception:  # pragma: no cover
 class _SpeechTask:
     text: str
     on_start: Optional[Callable[[], None]] = None
+    on_error: Optional[Callable[[], None]] = None
+    generation: int = 0
+    is_valid: Optional[Callable[[], bool]] = None
 
 
 class SpeechService:
@@ -53,6 +57,7 @@ class SpeechService:
         self._rate = settings.tts_rate
         self._volume = settings.tts_volume
         self._diag = bool(getattr(settings, "tts_diag_logs", False))
+        self._voicevox_clause_streaming = os.getenv("TTS_VOICEVOX_CLAUSE_STREAMING", "true").lower() in {"1", "true", "yes", "on"}
         self._azure_key = settings.tts_azure_key
         self._azure_region = settings.tts_azure_region
         self._azure_endpoint = settings.tts_azure_endpoint
@@ -70,8 +75,15 @@ class SpeechService:
         self._queue: queue.Queue[_SpeechTask | None] = queue.Queue()
         self._worker: threading.Thread | None = None
         self._lock = threading.Lock()
+        self._generation = 0
+        self._active_generation = 0
         self._azure_synthesizer = None
         self._voicevox_status_detail = ""
+        # pid of an engine this process launched, so the CPU-policy code does not
+        # have to discover it by enumerating every process on the machine. That
+        # scan costs ~1.9s here (386 processes, exe + cmdline each) and used to
+        # run on the GUI thread every 20s.
+        self._voicevox_engine_pid = 0
 
         self._runtime_ok = self._compute_runtime_ok()
         self._status_message = self._build_status_message()
@@ -201,7 +213,7 @@ class SpeechService:
                 creationflags |= getattr(subprocess, "DETACHED_PROCESS", 0)
                 creationflags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
 
-            subprocess.Popen(
+            process = subprocess.Popen(
                 [str(self._voicevox_engine_path)],
                 cwd=str(self._voicevox_engine_path.parent),
                 stdin=subprocess.DEVNULL,
@@ -209,6 +221,11 @@ class SpeechService:
                 stderr=subprocess.DEVNULL,
                 creationflags=creationflags,
             )
+            # Remember it: the policy code can then skip the full process scan.
+            try:
+                self._voicevox_engine_pid = int(getattr(process, "pid", 0) or 0)
+            except Exception:
+                self._voicevox_engine_pid = 0
 
             # Wait briefly for the local API to become ready.
             for _ in range(24):
@@ -223,6 +240,11 @@ class SpeechService:
     def get_status(self) -> tuple[bool, str]:
         return self._runtime_ok, self._status_message
 
+    @property
+    def voicevox_engine_pid(self) -> int:
+        """pid of a VOICEVOX engine this process launched, or 0 if we did not."""
+        return int(self._voicevox_engine_pid)
+
     def warmup_translation(self) -> TranslationStatus:
         if self._translation_service is None:
             return TranslationStatus(True, "translation disabled or not required")
@@ -233,7 +255,9 @@ class SpeechService:
             return TranslationStatus(True, "translation disabled or not required")
         return self._translation_service.get_status()
 
-    def speak(self, text: str, on_start: Optional[Callable[[], None]] = None) -> bool:
+    def speak(self, text: str, on_start: Optional[Callable[[], None]] = None,
+              on_error: Optional[Callable[[], None]] = None,
+              is_valid: Optional[Callable[[], bool]] = None) -> bool:
         if not self._runtime_ok:
             return False
         if self._muted:
@@ -241,10 +265,14 @@ class SpeechService:
         cleaned = self._clean_text(text)
         if not cleaned:
             return False
+        if is_valid is not None and not is_valid():
+            return False
         self.stop_current()
         self._clear_queue()
         self._diag_log(f"enqueue provider={self._provider} chars={len(cleaned)}")
-        self._queue.put(_SpeechTask(cleaned, on_start=on_start))
+        with self._lock:
+            self._queue.put(_SpeechTask(cleaned, on_start=on_start, on_error=on_error,
+                                       generation=self._generation, is_valid=is_valid))
         return True
 
     def set_muted(self, muted: bool) -> None:
@@ -260,6 +288,7 @@ class SpeechService:
         if not self._runtime_ok:
             return
         with self._lock:
+            self._generation += 1
             if self._provider == "edge":
                 try:
                     if pygame.mixer.get_init() and pygame.mixer.music.get_busy():
@@ -310,24 +339,37 @@ class SpeechService:
             task = self._queue.get()
             if task is None:
                 return
+            self._active_generation = task.generation
+            self._active_valid = task.is_valid
+            if not self._is_current():
+                continue
             started_ts = time.perf_counter()
             try:
                 prepared_text = task.text
                 if self._translation_service is not None:
+                    translation_started = time.perf_counter()
                     prepared_text = self._translation_service.translate(task.text)
+                    if not self._is_current():
+                        continue
                     if not prepared_text:
                         self._diag_log("skip voicevox: translation unavailable or unsafe")
-                        self._notify_on_start(task.on_start)
+                        self._notify_on_start(task.on_error or task.on_start)
                         continue
                     self._diag_log(
-                        f"translation source_chars={len(task.text)} ja_chars={len(prepared_text)}"
+                        f"translation source_chars={len(task.text)} ja_chars={len(prepared_text)} elapsed={time.perf_counter() - translation_started:.3f}s"
                     )
                 self._speak_once(prepared_text, task.on_start)
                 self._diag_log(f"done provider={self._provider} total={time.perf_counter() - started_ts:.3f}s")
             except Exception:
                 # Do not break app flow on TTS failures.
                 self._diag_log(f"failed provider={self._provider} total={time.perf_counter() - started_ts:.3f}s")
-                pass
+                if self._is_current():
+                    self._notify_on_start(task.on_error or task.on_start)
+
+    def _is_current(self) -> bool:
+        valid = getattr(self, "_active_valid", None)
+        return (self._active_generation == self._generation and not self._muted
+                and (valid is None or valid()))
 
     def _speak_once(self, text: str, on_start: Optional[Callable[[], None]] = None) -> None:
         if self._provider == "edge":
@@ -339,8 +381,8 @@ class SpeechService:
         if self._provider == "azure":
             self._speak_azure(text, on_start=on_start)
 
-    @staticmethod
-    def _notify_on_start(on_start: Optional[Callable[[], None]]) -> None:
+    def _notify_on_start(self, on_start: Optional[Callable[[], None]]) -> None:
+        self._active_valid = None  # Once playback begins, finish the whole comment.
         if on_start is None:
             return
         try:
@@ -354,11 +396,13 @@ class SpeechService:
         try:
             asyncio.run(self._synthesize_to_file(text, tmp_path))
             with self._lock:
-                if not pygame.mixer.get_init():
+                if not self._is_current():
                     return
+                if not pygame.mixer.get_init():
+                    raise RuntimeError("audio mixer unavailable")
                 pygame.mixer.music.load(tmp_path)
-                self._notify_on_start(on_start)
                 pygame.mixer.music.play()
+                self._notify_on_start(on_start)
 
             while True:
                 with self._lock:
@@ -372,19 +416,50 @@ class SpeechService:
             except OSError:
                 pass
 
+    @staticmethod
+    def _voicevox_parts(text: str, *, split_clauses: bool = True) -> list[str]:
+        output = []
+        for sentence in re.split(r"(?<=[。！？!?])\s*", text):
+            if not sentence:
+                continue
+            pending = [sentence]
+            while pending:
+                part = pending.pop()
+                boundaries = [match.end() for match in re.finditer(r"[、，,；;]", part)
+                              if 12 <= match.end() <= len(part) - 12]
+                if split_clauses and len(part) > 48 and boundaries:
+                    split = min(boundaries, key=lambda index: abs(index - len(part) / 2))
+                    pending.extend([part[split:], part[:split]])
+                else:
+                    output.append(part)
+        return output
+
     def _speak_voicevox(self, text: str, on_start: Optional[Callable[[], None]] = None) -> None:
+        # Keep sentence boundaries; synthesise one sentence ahead while playing.
+        parts = self._voicevox_parts(text, split_clauses=getattr(self, "_voicevox_clause_streaming", True))
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="voicevox-synthesis") as executor:
+            pending = executor.submit(self._prepare_voicevox, parts[0])
+            for index in range(len(parts)):
+                wav_bytes = pending.result()
+                if not self._is_current() or not wav_bytes:
+                    return
+                if index + 1 < len(parts):
+                    pending = executor.submit(self._prepare_voicevox, parts[index + 1])
+                self._play_voicevox(wav_bytes, on_start if index == 0 else None)
+
+    def _prepare_voicevox(self, text: str) -> bytes:
+        if not self._is_current():
+            return b""
         t0 = time.perf_counter()
         query = self._voicevox_audio_query(text)
         t1 = time.perf_counter()
+        if not self._is_current():
+            return b""
         wav_bytes = self._voicevox_synthesis(query)
-        t2 = time.perf_counter()
-        self._diag_log(
-            (
-                f"voicevox query={t1 - t0:.3f}s synthesis={t2 - t1:.3f}s "
-                f"wav_bytes={len(wav_bytes) if wav_bytes else 0}"
-            )
-        )
+        self._diag_log(f"voicevox query={t1 - t0:.3f}s synthesis={time.perf_counter() - t1:.3f}s")
+        return wav_bytes
 
+    def _play_voicevox(self, wav_bytes: bytes, on_start=None) -> None:
         fd, tmp_path = tempfile.mkstemp(prefix="pet_tts_", suffix=".wav")
         os.close(fd)
         try:
@@ -392,14 +467,16 @@ class SpeechService:
                 f.write(wav_bytes)
 
             with self._lock:
-                if not pygame.mixer.get_init():
+                if not self._is_current():
                     return
+                if not pygame.mixer.get_init():
+                    raise RuntimeError("audio mixer unavailable")
                 t3 = time.perf_counter()
                 pygame.mixer.music.load(tmp_path)
-                self._notify_on_start(on_start)
                 pygame.mixer.music.play()
+                self._notify_on_start(on_start)
                 t4 = time.perf_counter()
-                self._diag_log(f"voicevox load+play={(t4 - t3):.3f}s end_to_play={(t4 - t0):.3f}s")
+                self._diag_log(f"voicevox load+play={(t4 - t3):.3f}s")
 
             while True:
                 with self._lock:

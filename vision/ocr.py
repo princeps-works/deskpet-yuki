@@ -69,6 +69,163 @@ class OCRResult:
         return "\n".join(rows)[:limit]
 
 
+def _result_from_lines(lines: list[OCRLine]) -> OCRResult:
+    text = "\n".join(line.text for line in lines if line.text)
+    normalized = re.sub(r"\s+", " ", text).strip().casefold()
+    text_hash = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:20] if normalized else ""
+    confidences = [line.confidence for line in lines if line.confidence > 0.0]
+    average_confidence = sum(confidences) / len(confidences) if confidences else 0.0
+    coverage = 0.0
+    for line in lines:
+        if line.box is None:
+            continue
+        left, top, right, bottom = line.box
+        coverage += max(0.0, right - left) * max(0.0, bottom - top)
+    return OCRResult(
+        lines=tuple(lines),
+        text=text,
+        average_confidence=average_confidence,
+        text_coverage=min(1.0, coverage),
+        text_hash=text_hash,
+    )
+
+
+def filter_visual_novel_ocr_result(
+    result: OCRResult,
+    tracking: dict[str, Any],
+) -> tuple[OCRResult, str]:
+    """Cheap, conservative filtering for text read through VN artwork.
+
+    Strong sentence-like lines are never delayed. Only weak short fragments and
+    short mixed-script labels are rejected immediately. A line outside the
+    learned dialogue lane is also suppressed after it stays at the same place
+    across three otherwise-changing OCR frames, which catches background signs
+    without treating a slowly-read dialogue line as static artwork.
+    """
+    if not result.lines:
+        return result, ""
+
+    frame = int(tracking.get("frame", 0) or 0) + 1
+    tracking["frame"] = frame
+    samples = tracking.setdefault("dialogue_samples", [])
+    tracks = tracking.setdefault("line_tracks", {})
+    highest_confidence = max((float(line.confidence) for line in result.lines), default=0.0)
+    frame_signature = result.text_hash or f"frame-{frame}"
+    kept: list[OCRLine] = []
+    rejected: dict[str, int] = {}
+    learning_candidates: list[tuple[int, float, tuple[float, float, float]]] = []
+
+    def geometry(line: OCRLine) -> tuple[float, float, float] | None:
+        if line.box is None:
+            return None
+        left, top, _right, bottom = line.box
+        return ((top + bottom) / 2.0, max(0.01, bottom - top), left)
+
+    def in_dialogue_lane(item: tuple[float, float, float] | None) -> bool:
+        if item is None or not samples:
+            return False
+        center_y, height, left = item
+        return any(
+            abs(center_y - sample_y) <= max(0.07, (height + sample_height) * 1.4)
+            and abs(left - sample_left) <= 0.22
+            for sample_y, sample_height, sample_left in samples
+        )
+
+    for line in result.lines:
+        compact = re.sub(r"\s+", "", str(line.text or ""))
+        if not compact:
+            continue
+        cjk = sum(
+            "\u3400" <= char <= "\u9fff"
+            or "\u3040" <= char <= "\u30ff"
+            or "\uac00" <= char <= "\ud7af"
+            for char in compact
+        )
+        ascii_letters = sum(char.isascii() and char.isalpha() for char in compact)
+        has_dialogue_punctuation = any(char in "。！？!?「」『』…，," for char in compact)
+        confidence = float(line.confidence or 0.0)
+        item_geometry = geometry(line)
+        known_lane = in_dialogue_lane(item_geometry)
+        sentence_like = cjk >= 6 or has_dialogue_punctuation
+        name_like = 2 <= cjk <= 6 and ascii_letters == 0 and confidence >= 0.78
+        clean_short_cjk = (
+            cjk == len(compact)
+            and not re.search(r"\S\s+\S", str(line.text or ""))
+            and 1 <= cjk <= 6
+        )
+        short_weak = (
+            len(compact) <= 4
+            and confidence < 0.72
+            and not has_dialogue_punctuation
+            and not clean_short_cjk
+        )
+        mixed_label = (
+            ascii_letters >= 2
+            and cjk <= 6
+            and len(compact) <= 18
+            and not has_dialogue_punctuation
+        )
+        relative_weak = (
+            confidence > 0.0
+            and confidence < max(0.30, highest_confidence - 0.35)
+            and not sentence_like
+            and not name_like
+            and not clean_short_cjk
+        )
+
+        track_key = compact.casefold()
+        track = tracks.get(track_key)
+        if not isinstance(track, dict):
+            track = {"signatures": [], "geometry": item_geometry, "last_frame": frame}
+            tracks[track_key] = track
+        previous_geometry = track.get("geometry")
+        if item_geometry is not None and previous_geometry is not None:
+            if abs(item_geometry[0] - previous_geometry[0]) > 0.08:
+                track["signatures"] = []
+        signatures = track.setdefault("signatures", [])
+        if frame_signature not in signatures:
+            signatures.append(frame_signature)
+            del signatures[:-4]
+        track["geometry"] = item_geometry
+        track["last_frame"] = frame
+        stable_background = len(signatures) >= 3 and not name_like
+
+        reason = ""
+        if short_weak:
+            reason = "short_weak"
+        elif mixed_label and not known_lane:
+            reason = "mixed_label"
+        elif relative_weak and not known_lane:
+            reason = "relative_weak"
+        elif stable_background:
+            reason = "stable_background"
+        if reason:
+            rejected[reason] = rejected.get(reason, 0) + 1
+            continue
+
+        kept.append(line)
+        if (
+            item_geometry is not None
+            and sentence_like
+            and confidence >= 0.72
+            and ascii_letters <= cjk
+            and (not samples or known_lane)
+        ):
+            learning_candidates.append((cjk, confidence, item_geometry))
+
+    for _cjk, _confidence, item_geometry in sorted(learning_candidates, reverse=True)[:1]:
+        samples.append(item_geometry)
+    del samples[:-24]
+    for key in list(tracks):
+        if frame - int(tracks[key].get("last_frame", frame) or frame) > 20:
+            del tracks[key]
+
+    if not rejected:
+        return result, ""
+    note = ",".join(f"{name}={count}" for name, count in sorted(rejected.items()))
+    return _result_from_lines(kept), note
+
+
 def _empty_result() -> OCRResult:
     return OCRResult(lines=(), text="", average_confidence=0.0, text_coverage=0.0, text_hash="")
 
@@ -92,10 +249,14 @@ def _ensure_engine() -> None:
     try:
         kwargs: dict[str, Any] = {}
         # Explicitly pass RapidOCR thread knobs; this is more reliable than generic OMP env vars.
+        # Measured: leaving this at 0 makes a dialogue read take ~4.5s instead of
+        # ~1.5s, so default to a sane thread count rather than inheriting
+        # whatever the engine picks.
         threads = int(os.getenv("OCR_CPU_THREADS", "0") or 0)
-        if threads > 0:
-            kwargs["intra_op_num_threads"] = max(1, threads)
-            kwargs["inter_op_num_threads"] = 1
+        if threads <= 0:
+            threads = max(1, min(4, (os.cpu_count() or 2) // 4))
+        kwargs["intra_op_num_threads"] = max(1, threads)
+        kwargs["inter_op_num_threads"] = 1
 
         use_dml = os.getenv("OCR_USE_DML", "false").lower() in {"1", "true", "yes", "on"}
         use_cuda = os.getenv("OCR_USE_CUDA", "false").lower() in {"1", "true", "yes", "on"}

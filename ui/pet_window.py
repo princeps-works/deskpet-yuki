@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
 import time
+import ctypes
+from ctypes import wintypes
 from pathlib import Path
 
 from PyQt6.QtCore import QEvent, QPoint, QRect, QTimer, Qt, pyqtSignal
@@ -10,10 +13,20 @@ from PyQt6.QtWidgets import QLabel, QPushButton, QVBoxLayout, QWidget
 from desktop_pet.config.settings import Settings
 from desktop_pet.ui.bubble import SpeechBubble
 
+
+def native_drag_target(anchor: tuple[int, int, int, int], cursor: tuple[int, int]) -> tuple[int, int]:
+    cursor_x, cursor_y, window_x, window_y = anchor
+    return window_x + cursor[0] - cursor_x, window_y + cursor[1] - cursor_y
+
 try:
     from desktop_pet.ui.live2d_view import Live2DView
 except Exception:
     Live2DView = None
+
+try:
+    from desktop_pet.ui.vn_sidebar import VnSidebar
+except Exception:
+    VnSidebar = None
 
 
 class DesktopPet(QWidget):
@@ -27,10 +40,12 @@ class DesktopPet(QWidget):
     clear_scan_region_requested = pyqtSignal()
     tts_mute_toggled = pyqtSignal(bool)
     gaze_follow_toggled = pyqtSignal(bool)
+    live2d_drag_moved = pyqtSignal()
     tutor_mode_toggled = pyqtSignal(bool)
 
     def __init__(self, settings: Settings):
         super().__init__()
+        self.setWindowTitle("桌宠控制")
         self.settings = settings
         self.live2d_py_min_w = 180
         self.live2d_py_min_h = 220
@@ -48,6 +63,7 @@ class DesktopPet(QWidget):
         self.drag_moved = False
         self.drag_start_global = QPoint()
         self.drag_start_window_pos = QPoint()
+        self._native_drag_anchor: tuple[int, int, int, int] | None = None
         self.resizing = False
         self.resize_start_pos = QPoint()
         self.resize_start_w = 0
@@ -80,6 +96,30 @@ class DesktopPet(QWidget):
         self._bar_dragging = False
         self._ui_anchor_until = 0.0
         self._controls_visible = True
+        self.vn_sidebar = None
+        self._sidebar_left_at: float | None = None
+        self._sidebar_grace_sec = 0.45
+        # Traces every panel show/hide decision to data/vn_sidebar_debug.log.
+        # The pet is normally launched detached so stdout is not visible; this
+        # file is the only way to see why a decision was made. Set
+        # VN_SIDEBAR_DEBUG=0 to turn it off.
+        self._vn_sidebar_debug = os.getenv("VN_SIDEBAR_DEBUG", "1").strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        self._sidebar_hide_timer = QTimer(self)
+        self._sidebar_hide_timer.setSingleShot(True)
+        self._sidebar_hide_timer.timeout.connect(self._hide_vn_sidebar)
+        if VnSidebar is not None:
+            try:
+                self.vn_sidebar = VnSidebar(settings)
+                self.vn_sidebar.on_hover_changed = self.on_vn_sidebar_hover_changed
+                # Top-level widgets can appear as soon as they are created.
+                self.vn_sidebar.hide()
+            except Exception:
+                self.vn_sidebar = None
         self._controls_hide_timer = QTimer(self)
         self._controls_hide_timer.setSingleShot(True)
         self._controls_hide_timer.timeout.connect(self._hide_controls_if_idle)
@@ -147,7 +187,9 @@ class DesktopPet(QWidget):
         self._gaze_timer.timeout.connect(self._push_cursor_gaze)
         self._gaze_timer.start()
 
-        if self.live2d_py_mode:
+        if self.live2d_py_mode or self.visual_novel_mode_enabled:
+            # Two independent reasons to poll: the hover-revealed control bar
+            # (live2d-py) and the hover-revealed visual-novel side panel.
             self._controls_proximity_timer.start()
 
     def _init_live2d_py_host_window(self) -> None:
@@ -241,9 +283,11 @@ class DesktopPet(QWidget):
         row.addWidget(self.btn_comment)
         row.addWidget(self.btn_toggle_scan)
         row.addWidget(self.btn_visual_novel)
-        row.addWidget(self.btn_story_cache)
+        self.btn_story_cache.hide()
         row.addWidget(self.btn_select_region)
         row.addWidget(self.btn_clear_region)
+        self.btn_select_region.setVisible(not self.visual_novel_mode_enabled)
+        self.btn_clear_region.setVisible(not self.visual_novel_mode_enabled)
         row.addWidget(self.btn_tts)
         row.addWidget(self.btn_gaze)
         row.addWidget(self.btn_tutor)
@@ -319,9 +363,11 @@ class DesktopPet(QWidget):
         row.addWidget(self.btn_comment)
         row.addWidget(self.btn_toggle_scan)
         row.addWidget(self.btn_visual_novel)
-        row.addWidget(self.btn_story_cache)
+        self.btn_story_cache.hide()
         row.addWidget(self.btn_select_region)
         row.addWidget(self.btn_clear_region)
+        self.btn_select_region.setVisible(not self.visual_novel_mode_enabled)
+        self.btn_clear_region.setVisible(not self.visual_novel_mode_enabled)
         row.addWidget(self.btn_tts)
         row.addWidget(self.btn_gaze)
         row.addWidget(self.btn_tutor)
@@ -349,13 +395,16 @@ class DesktopPet(QWidget):
         if obj in {self.control_bar, self.drag_overlay} and self.live2d_py_mode:
             if event.type() in {QEvent.Type.Enter, QEvent.Type.MouseMove}:
                 self._set_controls_visible(True)
+                if obj is self.control_bar:
+                    # React to the strip immediately instead of waiting for the
+                    # 150ms hover poll.
+                    self._apply_vn_sidebar_visibility()
 
             if event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
                 self.dragging = True
                 self._bar_dragging = True
                 self.drag_moved = False
-                self.drag_start_global = event.globalPosition().toPoint()
-                self.drag_start_window_pos = self.pos()
+                self._start_drag(event.globalPosition().toPoint())
                 self._ui_anchor_until = time.monotonic() + 0.8
                 self.setCursor(Qt.CursorShape.ClosedHandCursor)
                 event.accept()
@@ -377,6 +426,7 @@ class DesktopPet(QWidget):
                 if self._bar_dragging:
                     self.dragging = False
                     self._bar_dragging = False
+                    self._native_drag_anchor = None
                     self._ui_anchor_until = time.monotonic() + 0.8
                     self.setCursor(Qt.CursorShape.ArrowCursor)
                     event.accept()
@@ -401,11 +451,11 @@ class DesktopPet(QWidget):
         if self.btn_visual_novel is not None:
             self.btn_visual_novel.setVisible(self._controls_visible)
         if self.btn_story_cache is not None:
-            self.btn_story_cache.setVisible(self._controls_visible)
+            self.btn_story_cache.setVisible(False)
         if self.btn_select_region is not None:
-            self.btn_select_region.setVisible(self._controls_visible)
+            self.btn_select_region.setVisible(self._controls_visible and not self.visual_novel_mode_enabled)
         if self.btn_clear_region is not None:
-            self.btn_clear_region.setVisible(self._controls_visible)
+            self.btn_clear_region.setVisible(self._controls_visible and not self.visual_novel_mode_enabled)
         if self.btn_tts is not None:
             self.btn_tts.setVisible(self._controls_visible)
         if self.btn_gaze is not None:
@@ -426,8 +476,159 @@ class DesktopPet(QWidget):
             return
         self._set_controls_visible(False)
 
+    # -- visual-novel side panel -------------------------------------------
+
+    def _vn_panel_anchor_rect(self) -> QRect:
+        """The small VN control strip that reveals the settings panel.
+
+        Only this strip triggers the panel -- hovering the model body or the
+        transparent host window must not, which is what "移到VN模式的小ui气泡窗上"
+        means. The rect is the control bar's geometry, slightly widened so the
+        cursor can travel from the strip to the panel across the gap.
+        """
+        button = self.btn_visual_novel
+        if button is not None and button.isVisible():
+            return QRect(button.mapToGlobal(QPoint(0, 0)), button.size()).adjusted(-6, -6, 6, 6)
+        return QRect()
+
+    def _sidebar_keep_alive(self) -> bool:
+        """True while the cursor is on the VN strip *or* on the open panel.
+
+        The panel sits beside the strip, so the cursor legitimately crosses a
+        gap on its way over. Treating the two rects as one hover zone avoids
+        the panel closing in that gap.
+        """
+        cursor = QCursor.pos()
+        if self._vn_panel_anchor_rect().contains(cursor):
+            return True
+        sidebar = self.vn_sidebar
+        if sidebar is not None and sidebar.isVisible():
+            margin = max(8, int(sidebar.width() * 0.04))
+            rect = sidebar.frameGeometry().adjusted(-margin, -margin, margin, margin)
+            if rect.contains(cursor):
+                return True
+        return False
+
+    def _show_vn_sidebar(self) -> None:
+        sidebar = self.vn_sidebar
+        if sidebar is None or not self.visual_novel_mode_enabled:
+            return
+        self._sidebar_hide_timer.stop()
+        anchor = self._vn_panel_anchor_rect()
+        sidebar.show_near(anchor.x(), anchor.y(), anchor.width(), anchor.height())
+
+    def _hide_vn_sidebar(self) -> None:
+        sidebar = self.vn_sidebar
+        if sidebar is not None and sidebar.isVisible():
+            sidebar.hide()
+
+    def _cursor_over_sidebar(self) -> bool:
+        sidebar = self.vn_sidebar
+        if sidebar is None or not sidebar.isVisible():
+            return False
+        return sidebar.frameGeometry().contains(QCursor.pos())
+
+    def _sidebar_should_show(self) -> bool:
+        """Single source of truth for panel visibility."""
+        if not self.visual_novel_mode_enabled or self.vn_sidebar is None:
+            return False
+        return self._sidebar_keep_alive()
+
+    def _apply_vn_sidebar_visibility(self) -> None:
+        """Drive the panel from the current cursor position on every tick.
+
+        Visibility is *computed* rather than driven by leave events, because the
+        panel used to be shown at startup and then never hidden once the cursor
+        moved away. The grace period is a deadline instead of a restarted timer:
+        this method runs every 150ms, so restarting a 300ms single-shot timer
+        here would keep pushing the deadline back and the panel would never
+        close.
+        """
+        sidebar = self.vn_sidebar
+        if sidebar is None:
+            return
+        if self._vn_sidebar_debug:
+            self._log_sidebar_decision(sidebar)
+        if self._sidebar_should_show():
+            self._sidebar_left_at = None
+            if not sidebar.isVisible():
+                self._show_vn_sidebar()
+            return
+        if not sidebar.isVisible():
+            self._sidebar_left_at = None
+            return
+        now = time.monotonic()
+        if self._sidebar_left_at is None:
+            self._sidebar_left_at = now
+            return
+        if (now - self._sidebar_left_at) >= self._sidebar_grace_sec:
+            self._sidebar_left_at = None
+            sidebar.hide()
+
+    def _log_sidebar_decision(self, sidebar) -> None:
+        """Opt-in trace (VN_SIDEBAR_DEBUG=1) for diagnosing hover behaviour.
+
+        Written to data/vn_sidebar_debug.log because the pet is normally started
+        detached, where stdout is not visible.
+        """
+        try:
+            cursor = QCursor.pos()
+            anchor = self._vn_panel_anchor_rect()
+            sb_rect = sidebar.frameGeometry()
+            line = (
+                f"cursor=({cursor.x()},{cursor.y()})"
+                f" pet=({self.x()},{self.y()},{self.width()}x{self.height()})"
+                f" anchor=({anchor.x()},{anchor.y()},{anchor.width()}x{anchor.height()})"
+                f" anchor_contains={int(anchor.contains(cursor))}"
+                f" sb=({sb_rect.x()},{sb_rect.y()},{sb_rect.width()}x{sb_rect.height()})"
+                f" sb_contains={int(sb_rect.contains(cursor))}"
+                f" sb_visible={int(sidebar.isVisible())}"
+                f" keep_alive={int(self._sidebar_keep_alive())}"
+                f" should_show={int(self._sidebar_should_show())}"
+                f" vn_mode={int(self.visual_novel_mode_enabled)}"
+            )
+            base = Path(__file__).resolve().parent.parent / "data"
+            base.mkdir(parents=True, exist_ok=True)
+            log_path = base / "vn_sidebar_debug.log"
+            if log_path.exists() and log_path.stat().st_size > 2_000_000:
+                log_path.write_text("", encoding="utf-8")
+            with log_path.open("a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+        except Exception:
+            pass
+
+    def sync_vn_sidebar(self) -> None:
+        """Hide the panel immediately when visual-novel mode is switched off."""
+        sidebar = self.vn_sidebar
+        if sidebar is None:
+            return
+        if not self.visual_novel_mode_enabled:
+            self._sidebar_hide_timer.stop()
+            self._sidebar_left_at = None
+            sidebar.hide()
+        else:
+            self._apply_vn_sidebar_visibility()
+
+    def _update_vn_sidebar_proximity(self) -> None:
+        """Hover handling shared by every renderer backend."""
+        self._apply_vn_sidebar_visibility()
+
+    def on_vn_sidebar_hover_changed(self, inside: bool) -> None:
+        """Immediate response to the panel's own enter/leave events.
+
+        The 150ms hover poll is fine for opening, but leaving the panel should
+        close it promptly instead of waiting for the next tick.
+        """
+        if not inside:
+            self._apply_vn_sidebar_visibility()
+
     def _check_controls_proximity(self) -> None:
-        if not self.live2d_py_mode or self.control_bar is None:
+        # Panel visibility is independent of the control bar: the panel must
+        # follow the cursor even when the control bar is unavailable.
+        self._update_vn_sidebar_proximity()
+        if self.control_bar is None:
+            return
+        if not self.live2d_py_mode:
             return
         if self.dragging or self.resizing or self._bar_dragging:
             self._set_controls_visible(True)
@@ -505,7 +706,28 @@ class DesktopPet(QWidget):
         ny = max(0.0, min(1.0, pos.y() / h))
         return nx, ny
 
+    def _start_drag(self, global_pos: QPoint) -> None:
+        self.drag_start_global = global_pos
+        self.drag_start_window_pos = self.pos()
+        self._native_drag_anchor = None
+        if not (self.live2d_py_mode and os.name == "nt"):
+            return
+        point = wintypes.POINT()
+        rect = wintypes.RECT()
+        user32 = ctypes.windll.user32
+        if user32.GetCursorPos(ctypes.byref(point)) and user32.GetWindowRect(int(self.winId()), ctypes.byref(rect)):
+            self._native_drag_anchor = (int(point.x), int(point.y), int(rect.left), int(rect.top))
+            self.live2d_drag_moved.emit()
+
     def _move_by_drag_delta(self, global_pos: QPoint) -> None:
+        if self._native_drag_anchor is not None:
+            point = wintypes.POINT()
+            user32 = ctypes.windll.user32
+            if user32.GetCursorPos(ctypes.byref(point)):
+                target_x, target_y = native_drag_target(self._native_drag_anchor, (int(point.x), int(point.y)))
+                if user32.SetWindowPos(int(self.winId()), 0, target_x, target_y, 0, 0, 0x0015):
+                    self.live2d_drag_moved.emit()
+                    return
         delta = global_pos - self.drag_start_global
         self.move(self.drag_start_window_pos + delta)
 
@@ -549,8 +771,7 @@ class DesktopPet(QWidget):
             else:
                 self.dragging = True
                 self.drag_moved = False
-                self.drag_start_global = event.globalPosition().toPoint()
-                self.drag_start_window_pos = self.pos()
+                self._start_drag(event.globalPosition().toPoint())
                 if self.live2d_py_mode:
                     self.grabMouse(Qt.CursorShape.ArrowCursor)
             event.accept()
@@ -623,6 +844,7 @@ class DesktopPet(QWidget):
             self.live2d_view.tap_at(nx, ny)
 
         self.dragging = False
+        self._native_drag_anchor = None
         self.drag_moved = False
         self.resizing = False
         if self.live2d_py_mode and self.mouseGrabber() is self:
@@ -700,6 +922,14 @@ class DesktopPet(QWidget):
             self.btn_visual_novel.setText(
                 "视觉小说：开" if self.visual_novel_mode_enabled else "视觉小说：关"
             )
+        if self.visual_novel_mode_enabled and not self._controls_proximity_timer.isActive():
+            # Non-live2d backends only need the timer while the side panel exists.
+            self._controls_proximity_timer.start()
+        elif not self.visual_novel_mode_enabled and not self.live2d_py_mode:
+            self._controls_proximity_timer.stop()
+        if self.control_bar is not None:
+            self._set_controls_visible(self._controls_visible)
+        self.sync_vn_sidebar()
 
     def set_visual_novel_story_name(self, name: str):
         if self.btn_story_cache is not None:

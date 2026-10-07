@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import base64
 import io
-from typing import Optional
+from typing import Callable, Optional
 
 from PIL import Image
 
@@ -54,19 +54,44 @@ class LLMClient:
         except Exception:
             return ""
 
-    def chat(self, user_text: str, system_prompt: str) -> str:
+    def chat(self, user_text: str, system_prompt: str, *, timeout_sec: float | None = None, on_text: Callable[[str], None] | None = None, disable_thinking: bool = False) -> str:
         if self._client is None:
             return f"[离线回声] 你说的是: {user_text}"
 
-        response = self._client.chat.completions.create(
-            model=self.settings.model_name,
-            messages=[
+        request_kwargs = {
+            "model": self.settings.model_name,
+            "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_text},
             ],
-            stream=False,
-        )
-        return self._extract_response_text(response)
+            "stream": on_text is not None,
+        }
+        if disable_thinking:
+            request_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+        if timeout_sec is not None:
+            request_kwargs["timeout"] = max(0.5, float(timeout_sec))
+        api_client = self._client.with_options(max_retries=0) if timeout_sec is not None else self._client
+        response = api_client.chat.completions.create(**request_kwargs)
+        if on_text is None:
+            return self._extract_response_text(response)
+        content = ""
+        try:
+            for chunk in response:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta.content
+                if isinstance(delta, str) and delta:
+                    content += delta
+                    on_text(content)
+        finally:
+            response.close()
+        return content
+
+    def chat_stream(self, user_text: str, system_prompt: str, on_text: Callable[[str], None], *, disable_thinking: bool = False) -> str:
+        return self.chat(user_text, system_prompt, on_text=on_text, disable_thinking=disable_thinking)
+
+    def chat_timeout(self, user_text: str, system_prompt: str, timeout_sec: float) -> str:
+        return self.chat(user_text, system_prompt, timeout_sec=timeout_sec)
 
     def multimodal_chat(
         self,

@@ -22,7 +22,7 @@ class _SemanticPlannerClient(_FakeClient):
             return (
                 '{"queries":["魔法少女的魔女裁判 主要人物",'
                 '"魔法少女的魔女裁判 角色介绍"],'
-                '"entity":"魔法少女的魔女裁判","intent":"查询主要人物",'
+                '"entity":"魔法少女的魔女裁判","intent":"查询主要人物","work_type":"游戏",'
                 '"keywords":["魔法少女","裁判","游戏"]}'
             )
         return super().chat(user_text, system_prompt)
@@ -35,7 +35,7 @@ class _GenericPlannerClient(_FakeClient):
             return (
                 '{"queries":["Python asyncio TaskGroup 使用方法",'
                 '"Python 结构化并发 官方文档"],'
-                '"entity":"Python asyncio TaskGroup","intent":"查询技术用法",'
+                '"entity":"Python asyncio TaskGroup","intent":"查询技术用法","work_type":"",'
                 '"keywords":["Python","asyncio","TaskGroup"]}'
             )
         return super().chat(user_text, system_prompt)
@@ -48,7 +48,7 @@ class _TopicPlannerClient(_FakeClient):
             return (
                 '{"queries":["伊朗 美国 关系 最新动态","美国 伊朗 外交 最新消息"],'
                 '"entity":"伊朗与美国关系","entities":["伊朗","美国"],'
-                '"entity_alternatives":[],"intent":"查询伊美关系最新现状",'
+                '"entity_alternatives":[],"intent":"查询伊美关系最新现状","work_type":"",'
                 '"keywords":["伊朗","美国","关系"],'
                 '"query_type":"news_topic","strategy":"direct",'
                 '"relevance_terms":["伊朗","美国","关系"],'
@@ -69,7 +69,7 @@ class _ShortAliasPlannerClient(_FakeClient):
                 '{"retrieval":"web","decision_confidence":0.95,'
                 '"local_evidence_sufficient":false,"reason":"用户明确要求检索",'
                 '"queries":["樱云 风见司 视觉小说","樱云 所长 剧情"],'
-                '"entity":"樱云","entity_alternatives":[],"intent":"查询主要故事情节",'
+                '"entity":"樱云","entity_alternatives":[],"intent":"查询主要故事情节","work_type":"视觉小说",'
                 '"keywords":["樱云","风见司","视觉小说"],'
                 '"query_type":"work_alias","strategy":"entity_first",'
                 '"entities":["樱云","风见司","所长"],'
@@ -228,6 +228,83 @@ def test_llm_semantic_planner_supports_generic_non_character_intent():
         assert "intent=查询技术用法" in debug
 
 
+def test_invalid_planner_output_falls_back_to_broad_raw_query():
+    class InvalidPlanner(_FakeClient):
+        def chat(self, user_text: str, system_prompt: str) -> str:
+            return "not json"
+
+    with TemporaryDirectory() as temp_dir:
+        mgr = DialogManager(InvalidPlanner(), memory_path=Path(temp_dir) / "memory.json")
+        raw = "樱云的情节简介是什么"
+        queries, relevance, debug = mgr._plan_web_search_queries(raw)
+        assert queries == [raw, "樱云"]
+        assert relevance == "樱云"
+        assert "local_fallback:invalid_json" in debug
+        assert "strategy=direct" in debug
+
+
+def test_invalid_structured_plan_keeps_original_query():
+    class InvalidFieldsPlanner(_FakeClient):
+        def chat(self, user_text: str, system_prompt: str) -> str:
+            return '{"retrieval":"web","queries":["樱云"],"entity":{"bad":"shape"},"intent":"剧情简介","work_type":"galgame"}'
+
+    with TemporaryDirectory() as temp_dir:
+        mgr = DialogManager(InvalidFieldsPlanner(), memory_path=Path(temp_dir) / "memory.json")
+        queries, relevance, debug = mgr._plan_web_search_queries("樱云的情节简介是什么")
+        assert queries == ["樱云的情节简介是什么", "樱云"]
+        assert relevance == "樱云"
+        assert "local_fallback:invalid_fields" in debug
+
+
+def test_missing_work_type_keeps_original_query():
+    class MissingWorkTypePlanner(_FakeClient):
+        def chat(self, user_text: str, system_prompt: str) -> str:
+            return '{"retrieval":"web","queries":["樱云"],"entity":"樱云","intent":"剧情简介"}'
+
+    with TemporaryDirectory() as temp_dir:
+        mgr = DialogManager(MissingWorkTypePlanner(), memory_path=Path(temp_dir) / "memory.json")
+        queries, relevance, debug = mgr._plan_web_search_queries("樱云的情节简介是什么")
+        assert queries == ["樱云的情节简介是什么", "樱云"]
+        assert relevance == "樱云"
+        assert "local_fallback:invalid_fields" in debug
+
+
+def test_structured_work_type_drives_short_title_query_without_story_cache():
+    class WorkPlanner(_FakeClient):
+        def chat(self, user_text: str, system_prompt: str) -> str:
+            if "检索规划器" in system_prompt:
+                return json.dumps({
+                    "retrieval": "web", "decision_confidence": 0.9,
+                    "local_evidence_sufficient": False,
+                    "queries": ["樱云的情节简介是什么"],
+                    "entity": "樱云", "intent": "查询情节简介",
+                    "work_type": "视觉小说", "strategy": "entity_first",
+                }, ensure_ascii=False)
+            return super().chat(user_text, system_prompt)
+
+    with TemporaryDirectory() as temp_dir:
+        mgr = DialogManager(WorkPlanner(), memory_path=Path(temp_dir) / "memory.json")
+        mgr.set_web_search_enabled(True)
+        collected = []
+
+        def collect(queries, **_kwargs):
+            collected.extend(queries)
+            return ([
+                _SearchCandidate(
+                    "Baidu/AI", queries[0], "樱色之云*绯色之恋",
+                    "这是一部视觉小说游戏，故事讲述风见司穿越到百年前的东京，"
+                    "成为侦探事务所所长的助手，一起调查悬疑案件，并逐渐接近穿越的真相。",
+                    "https://example.org/sakura", 1,
+                )
+            ], ["baidu_ai:1"])
+
+        mgr._collect_search_candidates_cached = collect
+        context, debug = mgr._build_web_search_context("樱云的情节简介是什么")
+        assert collected[0] == "樱云 galgame 剧情简介"
+        assert "樱色之云*绯色之恋" in context
+        assert "work_type=视觉小说" in debug
+
+
 def test_llm_semantic_planner_preserves_structured_topic_strategy():
     with TemporaryDirectory() as temp_dir:
         mgr = DialogManager(_TopicPlannerClient(), memory_path=Path(temp_dir) / "memory.json")
@@ -293,6 +370,68 @@ def test_short_alias_ranking_requires_auxiliary_entity_evidence():
     assert rejected == 1
 
 
+def test_other_active_story_does_not_hide_short_title_search_result():
+    assert DialogManager._focus_web_query("樱云的情节简介是什么") == "樱云"
+    with TemporaryDirectory() as temp_dir:
+        mgr = DialogManager(
+            _FakeClient(), memory_path=Path(temp_dir) / "memory.json",
+            visual_novel_planner_context_provider=lambda: "剧情摘要: 《柠檬果酱乐队》的故事",
+        )
+        mgr.set_web_search_enabled(True)
+        mgr._plan_web_search_queries = lambda *_args, **_kwargs: (
+            ["樱云 情节简介"], "樱云",
+            "semantic_plan=llm;retrieval=web;strategy=entity_first;intent=查询情节简介;relevance_terms=樱云|柠檬果酱乐队",
+        )
+        queries = []
+
+        def collect(search_queries, **_kwargs):
+            queries.extend(search_queries)
+            return ([
+                _SearchCandidate(
+                    "Baidu/AI", search_queries[0], "樱色之云*绯色之恋",
+                    "这是一部视觉小说游戏，故事讲述青年风见司穿越到百年前的东京，"
+                    "成为侦探事务所所长的助手，一起调查悬疑案件，并逐渐接近穿越的真相。",
+                    "https://example.org/sakura", 1,
+                )
+            ], ["baidu_ai:1"])
+
+        mgr._collect_search_candidates_cached = collect
+        context, debug = mgr._build_web_search_context("樱云的情节简介是什么")
+        assert queries[0] == "樱云 galgame 剧情简介"
+        assert "樱色之云*绯色之恋" in context
+        assert "short_alias_guard=on" not in debug
+
+
+def test_short_title_direct_strategy_uses_work_query():
+    with TemporaryDirectory() as temp_dir:
+        mgr = DialogManager(
+            _FakeClient(), memory_path=Path(temp_dir) / "memory.json",
+            visual_novel_planner_context_provider=lambda: "剧情摘要: 《柠檬果酱乐队》的故事",
+        )
+        mgr.set_web_search_enabled(True)
+        mgr._plan_web_search_queries = lambda *_args, **_kwargs: (
+            ["樱云 情节简介"], "樱云",
+            "semantic_plan=llm;retrieval=web;strategy=direct;intent=查询情节简介;relevance_terms=樱云|剧情简介",
+        )
+        queries = []
+
+        def collect(search_queries, **_kwargs):
+            queries.extend(search_queries)
+            return ([
+                _SearchCandidate(
+                    "Baidu/AI", search_queries[0], "樱色之云*绯色之恋",
+                    "这是一部视觉小说游戏，故事讲述青年风见司穿越到百年前的东京，"
+                    "成为侦探事务所所长的助手，一起调查悬疑案件。",
+                    "https://example.org/sakura", 1,
+                )
+            ], ["baidu_ai:1"])
+
+        mgr._collect_search_candidates_cached = collect
+        context, _debug = mgr._build_web_search_context("樱云的情节简介是什么")
+        assert queries[0] == "樱云 galgame 剧情简介"
+        assert "樱色之云*绯色之恋" in context
+
+
 def test_visual_novel_hint_disambiguates_alias_then_runs_one_targeted_query():
     with TemporaryDirectory() as temp_dir:
         enabled = {"value": True}
@@ -301,7 +440,7 @@ def test_visual_novel_hint_disambiguates_alias_then_runs_one_targeted_query():
             client,
             memory_path=Path(temp_dir) / "memory.json",
             visual_novel_planner_context_provider=lambda: (
-                "剧情摘要: 风见司穿越到大正时代。\n关键事实: 风见司协助所长调查案件"
+                "剧情摘要: 《樱云》风见司穿越到大正时代。\n关键事实: 风见司协助所长调查案件"
                 if enabled["value"]
                 else ""
             ),
@@ -559,6 +698,20 @@ def test_reply_reuses_prepared_web_search_without_refetching():
         assert "联网检索参考：测试事实" in client.last_user_text
 
 
+def test_reply_includes_search_urls_when_sources_requested():
+    with TemporaryDirectory() as temp_dir:
+        mgr = DialogManager(_FakeClient(), memory_path=Path(temp_dir) / "memory.json")
+        mgr.set_web_search_enabled(True)
+        reply = mgr.reply(
+            "请给来源",
+            prepared_web_search=(
+                "联网检索参考：\n- [Baidu/AI | https://example.org/page | 相关度2.0] 事实",
+                "confidence=0.80",
+            ),
+        )
+        assert "https://example.org/page" in reply
+
+
 def test_search_ranking_rejects_unrelated_music_results():
     candidates = [
         _SearchCandidate(
@@ -778,3 +931,142 @@ def test_baidu_html_parser_extracts_title_snippet_and_rank():
     assert candidates[0].title == "魔法少女的魔女裁判"
     assert "推理文字冒险游戏" in candidates[0].snippet
     assert candidates[0].source_rank == 1
+
+
+def test_web_followup_requeries_once_when_first_results_miss_the_subject():
+    with TemporaryDirectory() as temp_dir:
+        mgr = DialogManager(_FakeClient(), memory_path=Path(temp_dir) / "memory.json")
+        mgr.set_web_search_enabled(True)
+        mgr._plan_web_search_queries = lambda *_args, **_kwargs: (
+            ["Python asyncio TaskGroup"],
+            "asyncio TaskGroup",
+            "retrieval=web;strategy=direct;intent=查询技术用法;relevance_terms=TaskGroup",
+        )
+        calls = []
+
+        def collect(queries, **_kwargs):
+            calls.extend(queries)
+            if queries[0].startswith("site:"):
+                return ([
+                    _SearchCandidate(
+                        "Bing/RSS", queries[0], "asyncio.TaskGroup — Python 官方文档",
+                        "使用 async with TaskGroup 和 create_task 管理并发任务。",
+                        "https://docs.python.org/3/library/asyncio-task.html", 1,
+                    )
+                ], ["search_cache=miss"])
+            return ([
+                _SearchCandidate(
+                    "Bing/RSS", queries[0], "Download Python", "Python 下载页面",
+                    "https://www.python.org/downloads/", 1,
+                )
+            ], ["search_cache=miss"])
+
+        mgr._collect_search_candidates_cached = collect
+        mgr._plan_web_followup = lambda *_args, **_kwargs: (
+            "search", "site:docs.python.org asyncio.TaskGroup", -1
+        )
+        context, debug = mgr._build_web_search_context("请搜索 TaskGroup 的用法")
+        assert calls == ["Python asyncio TaskGroup", "site:docs.python.org asyncio.TaskGroup"]
+        assert "docs.python.org" in context
+        assert "followup=search:" in debug
+
+
+def test_web_followup_opens_relevant_page_when_snippet_lacks_answer():
+    with TemporaryDirectory() as temp_dir:
+        mgr = DialogManager(_FakeClient(), memory_path=Path(temp_dir) / "memory.json")
+        mgr.set_web_search_enabled(True)
+        mgr._plan_web_search_queries = lambda *_args, **_kwargs: (
+            ["魔法少女的魔女审判"],
+            "魔法少女的魔女审判",
+            "retrieval=web;strategy=direct;intent=查询主要角色;relevance_terms=魔法少女的魔女审判",
+        )
+        mgr._collect_search_candidates_cached = lambda queries, **_kwargs: ([
+            _SearchCandidate(
+                "Bing/RSS", queries[0], "魔法少女的魔女审判",
+                "这是一部推理冒险游戏。", "https://example.org/game", 1,
+            )
+        ], ["search_cache=miss"])
+        mgr._plan_web_followup = lambda *_args, **_kwargs: ("open", "", 0)
+        opened = []
+
+        def open_page(url, **kwargs):
+            opened.append((url, kwargs["search_result"]))
+            return "网页直连参考：\n- 正文摘录: 主要角色：爱丽丝和莉莉。"
+
+        mgr._build_direct_url_context = open_page
+        context, debug = mgr._build_web_search_context("请搜索这部游戏的主要角色")
+        assert opened == [("https://example.org/game", True)]
+        assert "爱丽丝和莉莉" in context
+        assert "followup=open_ok" in debug
+
+
+def test_search_result_page_rejects_local_and_http_urls():
+    assert DialogManager._public_search_result_url("https://example.org/page")
+    assert not DialogManager._public_search_result_url("http://example.org/page")
+    assert not DialogManager._public_search_result_url("https://127.0.0.1/page")
+    assert not DialogManager._public_search_result_url("https://localhost/page")
+
+
+def test_character_summary_is_not_mistaken_for_a_name_list():
+    candidate = _SearchCandidate(
+        "Baidu/AI", "游戏角色", "游戏介绍",
+        "故事围绕十三位角色展开，她们被关在孤岛监狱。",
+        "https://example.org/game", 1,
+    )
+    ranked = [(2.0, candidate)]
+    assert not DialogManager._is_search_context_sufficient(
+        ranked, intent="查询主要角色", confidence=0.9,
+    )
+    with TemporaryDirectory() as temp_dir:
+        mgr = DialogManager(_FakeClient(), memory_path=Path(temp_dir) / "memory.json")
+        context, debug = mgr._finalize_web_search_context(
+            candidates=[candidate], query_text="游戏角色", intent_text="查询主要角色",
+            max_chars=1200, debug_reasons=[],
+        )
+        assert "https://example.org/game" in context
+        assert "evidence_level=snippet_only" in debug
+
+
+def test_baidu_ai_search_api_normalizes_references_and_routes_as_primary_source():
+    from desktop_pet.llm import dialog_manager
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _limit):
+            return json.dumps({"references": [{
+                "title": "Python asyncio.TaskGroup 官方文档",
+                "url": "https://docs.python.org/3/library/asyncio-task.html",
+                "content": "使用 async with 创建任务组。",
+            }]}).encode("utf-8")
+
+    class _Opener:
+        def open(self, request, timeout):
+            assert request.full_url.endswith("/v2/ai_search/web_search")
+            assert timeout == 3
+            assert json.loads(request.data)["search_source"] == "baidu_search_v2"
+            return _Response()
+
+    with TemporaryDirectory() as temp_dir:
+        manager = DialogManager(
+            _FakeClient(), memory_path=Path(temp_dir) / "memory.json",
+            baidu_ai_search_api_key="test-key",
+        )
+        original = dialog_manager._WEB_OPENER
+        dialog_manager._WEB_OPENER = _Opener()
+        try:
+            found = manager._fetch_search_source("baidu_ai", "asyncio.TaskGroup", 3)
+        finally:
+            dialog_manager._WEB_OPENER = original
+        assert len(found) == 1
+        assert found[0].source == "Baidu/AI"
+        assert "async with" in found[0].snippet
+
+        invoked = []
+        manager._fetch_search_source = lambda source, *_args: (invoked.append(source) or [])
+        manager._collect_search_candidates(["asyncio.TaskGroup"], timeout_sec=0.5)
+        assert invoked == ["baidu_ai"]
