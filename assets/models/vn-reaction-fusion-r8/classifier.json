@@ -1,0 +1,21 @@
+{
+  "model_id": "target-gru-fusion-r8",
+  "encoder_directory": "../vn-reaction-v64",
+  "labels": [
+    "silence",
+    "speak"
+  ],
+  "threshold": 0.3507848381996155,
+  "selection": "minimum validation BCE among six r8 runs; FIR5 validation threshold",
+  "source_run": "fusion_20261028",
+  "best_epoch": 6,
+  "validation_bce": 0.33350606429266527,
+  "source_checkpoint_sha256": "6634eb3e4b6091f46d5382b6e7eec81da03f3f780fd830b0062203d8b15d7663",
+  "head_sha256": "8d87f228466eeec641e0a6b9633872b58bcbc202a21ea1e6c00f730f78c2fa1a",
+  "encoder_sha256": "28f6678ff19cfbd2f9aa197550be46925b7ff6fc24a5ea759830519a60ee534b",
+  "max_turns": 8,
+  "deployment_checks": {
+    "head_max_abs_error": 4.2084138840436935e-08,
+    "shared_encoder_max_abs_error": 2.86102294921875e-06
+  }
+}

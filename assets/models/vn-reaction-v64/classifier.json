@@ -1,0 +1,24 @@
+{
+  "model_id": "window-linear-v64",
+  "labels": [
+    "silence",
+    "brief",
+    "full"
+  ],
+  "encoder": "BGE-small-zh-v1.5 FP32 ONNX",
+  "pooling": "target token mean, normalized active/full concatenation",
+  "max_length": 512,
+  "active_record_age_less_than": 5,
+  "head_source_sha256": "3c9881a2cd673dab13177cd1c644091d7c865eb7f40709bcc11bfa647df3f885",
+  "test_first_blind": {
+    "n": 28,
+    "three_class_correct": 16,
+    "speak_correct": 18,
+    "silence_false_positive": 8
+  },
+  "source": "offline v64; no new training during installation",
+  "assets": {
+    "encoder.onnx": "28f6678ff19cfbd2f9aa197550be46925b7ff6fc24a5ea759830519a60ee534b",
+    "head.npz": "4a8a612f9963f5440c8dd12e3c9ee553905e4425e5430d2b5dea3d3512a3c0fc"
+  }
+}

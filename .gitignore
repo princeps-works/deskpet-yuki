@@ -33,5 +33,3 @@ data/_*.py
 scripts/_*.py
 
 皮套/**/runtime/live2d_runtime_*.model3.json
-assets/models/vn-reaction-v64/
-assets/models/vn-reaction-fusion-r8/
