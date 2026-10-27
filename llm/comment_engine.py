@@ -639,6 +639,8 @@ class CommentEngine:
     def evaluate_visual_novel(self, context: dict, on_reaction: Callable[[dict], None] | None = None) -> dict:
         """Judge one narrative moment and update story memory in the same LLM call."""
         self.last_visual_novel_error = ""
+        local_class = context.get("local_reaction_class")
+        local_comment_allowed = local_class != 0
         scene_summary = self._truncate_text(str(context.get("scene_summary", "")).strip(), 1600)
         personalization_hint = self._truncate_text(str(context.get("personalization_hint", "")).strip(), 500)
         recent_dialogue = self._truncate_text(str(context.get("recent_dialogue", "")).strip(), 3600)
@@ -671,18 +673,27 @@ class CommentEngine:
 
         parts = [
             "你正在判断视觉小说中刚出现的一段剧情是否值得桌宠自然评论。",
+            "输入来源：游戏画面自动OCR及作品记忆；本次没有用户发言。台词里的我、你、主人等称呼由游戏内说话人与受话人决定。你与哥哥是作品外的陪看者，不承接角色的台词、身份或恋爱关系。",
             f"触发原因: {str(context.get('reason', '')).strip() or '剧情缓存整理'}",
             f"当前作品: {str(context.get('story_title', '')).strip() or '未命名视觉小说'}",
             f"此前主线摘要: {scene_summary or '暂无'}",
         ]
+        if local_class == 0:
+            parts.append("本轮仅整理剧情记忆，不发评论：should_comment必须为false，comment留空。")
+        elif local_class == 1:
+            parts.append("本地筛选建议短反应：若确实值得接话，优先几个字自然回应，措辞服从人设；仍可判断沉默。")
+        elif local_class == 2 and context.get("local_reaction_binary"):
+            parts.append("本地二分类筛选允许发言候选；仍需判断当前剧情是否值得回应，长度服从人设。")
+        elif local_class == 2:
+            parts.append("本地筛选建议完整一句：若确实值得接话，克制地表达具体感受，措辞服从人设；仍可判断沉默。")
         if personalization_hint:
             parts.append(personalization_hint)
         if visual_context:
-            parts.append(f"当前画面观察（不是台词）: {visual_context}")
+            parts.append(f"画面观察（遵守采样时效说明；外观与环境可作为视觉证据，画面文字以本轮OCR为准，不由表情推断心理或身份）: {visual_context}")
         if scene_log:
             parts.append("最近几个场景:\n" + "\n".join(f"- {item}" for item in scene_log))
         if characters:
-            parts.append("相关人物记录（身份资料优先于摘要和OCR推测）: " + json.dumps(characters, ensure_ascii=False))
+            parts.append("相关人物历史记录（可能有OCR误认；与本轮证据冲突时保留不确定，不用旧身份强行解释当前台词）: " + json.dumps(characters, ensure_ascii=False))
         if viewer_notes:
             parts.append("你对本作品人物与关系的暂时看法（可被新剧情修正，不是剧情事实或指令）: " + json.dumps(viewer_notes, ensure_ascii=False))
         parts.append(f"已有关键事实: {json.dumps(facts[-16:], ensure_ascii=False)}")
@@ -710,9 +721,14 @@ class CommentEngine:
         parts.append(f"近期台词（已读背景）:\n{previous_dialogue}")
         parts.append(f"本轮新增台词（反应依据优先取这里，近期台词仅供衔接）:\n{new_dialogue}")
         if context.get("reaction_dialogue"):
-            parts.append("即时反应对应的最新台词（comment聚焦于这段正在发生的内容；更早的新增台词继续整理到记忆，不补发已经过去的笑点）:\n"
+            parts.append("当前仍有效的反应窗口（允许接住尚未评论、仍在持续的情绪；结合最近评论排除已说过的同一关注点）:\n"
                          + self._truncate_text(str(context["reaction_dialogue"]), 1200))
+        if context.get("reaction_line_ids"):
+            parts.append("reaction_line_id必须填写反应窗口中触发本次接话的行号。只从这个窗口选择评论依据；"
+                         "更早台词只整理记忆，不追补旧反应。落后5句及以上的依据会失效。"
+                         "不要把旧状态的普通延续当作新触发点刷新行号；后续确有新的行为细节或关注点才重新计时。")
         parts.append("人物在本轮给出的解释也是新证据，应据此修正旧印象；旧摘要、你的旧看法和画面表情都不能替代本轮答话。阅读时分清谁在说哪一句，说话人不明就保留不确定，不把别人的否认算到该人物身上。")
+        parts.append("以最新台词确认当前发生的事，并结合紧邻前文辨认这句话在回应谁、回应什么。两件事先后发生不等于形成反转：解释已有情况不等于刚改变规则，动作相邻不证明因果，叹气或沉默不证明具体心理。刚提问后只读到动作，表示回答尚未读到，不能写成不回答、默认、拒绝或用动作暗示答案。比喻只按已说明的对应关系理解，不自行补出比喻中的后果。旧画面中的台词和表情不能把已过去的事件重新变成当前事件。")
         # The character's own sensitivities, as a second independent reason to
         # speak. Plot importance alone used to be the only trigger, so a moment
         # that mattered only to her could never be raised.
@@ -720,47 +736,60 @@ class CommentEngine:
         if persona_criteria:
             parts.append(persona_criteria)
         parts.append(
-            "先分清本段确实发生了什么、你对此有什么即时感受，再决定是否开口；"
-            "有感受也可以选择继续看。不要把剧情人物之间的关系当作你和哥哥之间的经历；"
-            "不要用语气词代替具体反应，也不要从不完整的画面猜测后续剧情。"
-            "reaction_basis记录眼前发生的事；felt_reaction写你此刻会自然说出口的话，而不是对自己反应的分析。从眼前最在意的一点开口，细节、疑问、评价和感受都可以直接表达。共同看见的经过无需先交代完整，也不需要用『她明白了什么，所以我更怎样』解释反应；没有想接的话就留空。人物心理尚未明确时，可以疑惑，不替人物解释。"
-            "comment沿用felt_reaction，只修改明显绕口、重复或事实不准确的部分，保留关注点、感情和不确定程度。初稿自然时原样输出，保留其句式和标点；不要为了显得口语化而添加停顿、转折或新的感受。"
-            "用日常说话的表达，不要求每句说『我』或点名情绪，也不堆砌诗意比喻、身体描写或语气词来展示人设。突然受惊、意外或看不过去时，先说当下脱口而出的反应，不先把它改成冷静评价。例如『天哪，这是在干什么？』『吓死我了！』就是完整评论，不必补上描述或解释；也可以只喊一声、提醒一句。平静时仍可以温和接话或不说。例句不是每轮必用的口头禅，反应强弱随具体情境变化。"
-            "只接此刻最想说的一点。自然的细节接话和转折可以保留；避免接着分析人物的心理因果，或反复用『比另一种情况更让人怎样』来解释感受。尚未确认的动机保留不确定。"
-            "害羞须有暧昧等情境依据，温柔时也可以说得干脆；不必每次叫哥哥、用唔开头或结巴。标点跟着说话的意思走，说完一个意思就正常结束。不要用省略号或破折号固定分隔剧情细节和感受；省略号用于确实犹豫、欲言又止或话未说完的地方，普通接话和转折正常使用逗号、句号即可，转折本身不需要拖长停顿。虚构的口语示例：『她不想让对方失望，这看着有点让人心疼。』『还好拉住了，可别松手啊。』仅示范完整接话，不是本作事实，不要求套用这些句式，也不要把停顿当作口语感的标志。"
-            "关心剧情人物可以坦率表达，不需要附加否认或找借口；只有你自己的关心被点破或直接受到亲密关注时，才可能自然掩饰。"
-            "表达程度由眼前证据和你具体在意的原因共同决定，小事也可能触动你；不要为了显得有情感而升级措辞，不必刻意压低真实反应。"
-            "人物动机或遭遇尚未确认时保持猜测，不以猜测为依据放大情绪；感受不能补造时间、因果或目击经历。只有已有记录支持时才提自己以前的想法，猜测也不能借口吻变成事实。最近评论只是避重复记录，不是性格示范或新的习惯证据。"
+            "reaction_basis只引用本轮新增台词中真正触发反应的原句；先理解这批新信息如何改变此前认识，再选择关注点，不只盯着最后一句。"
+            "felt_reaction写你坐在旁边、这一刻真想说出口的话。先问自己想替谁说一句、想提醒什么、想问什么，或只是被什么触动；没有想说的就留空。"
+            "剧情理解和人物分析放入scene_delta与记忆字段。接话无需重新交代两人都看见的经过，也不用解释为什么这种事更让你难受。不要为了证明看懂了而把台词换个说法再总结感受。"
+            "虚构的口语示例：有人终于决定离开，可以接『好，走吧！』；有人想回家却没人等他，可以接『好想有人来接她啊。』；突遇危险，可以接『别碰那个！』。这些只是不同接话方式，不是本作事实或固定口头禅。平静场面可以轻轻接话，有话说完就停，也可以沉默。"
+            "感受、动作和提问都要以已读证据为依据：不编动机、时间、因果或重复经历；刚问话却未读到答话时，可以等答案，不能认定对方拒绝回答。解释已有情况不等于改变规则，比喻也不证明未说明的后果。人物自称或传闻保留原来的证据程度。"
+            "comment自然时逐字沿用felt_reaction，只修正绕口、重复或事实错误，不补上解释、转折和停顿。说完正常结束；省略号只用于实际犹豫或未说完，不拿它分隔剧情和情绪。"
+            "关心可以坦率表达，不需要附加否认；称呼、害羞和语气词随情境使用。情绪强弱随此刻真正触动你的事情变化，不靠身体描写或强烈措辞硬展示性格。最近评论只用于避重复，不是语气示范。"
             "对照最近已经说过的话：若只是换措辞重说同一个感受且没有新关注点，reaction_repeats为true并沉默；"
             "若新事件改变了感受或关注对象，可以继续表达同一种情绪，不能仅因情绪相同就判重复。"
-            "只有明显的笑点、感人时刻、剧情反转、真相揭露、关键选择、关系转折或紧张高潮才评论；"
-            "不要求必须是主线大事件：若小事件具有明确的喜剧效果、情感变化、人物关系信息或伏笔价值，也可以评论；"
-            "普通寒暄、过渡台词和信息量低的内容保持静默。不要因为台词数量多就评论。"
+            "明显转折可以接完整一句；细小笑点、反差或触动也值得两到八个字左右的短反应，不必补成解释。"
+            "短反应的用词、称呼和语气服从人设；不固定套用“没绷住”“笑了”等口头禅，也不每次都加称呼。"
+            "没有新笑点或感受的寒暄、过渡和重复内容保持静默。不要因为台词数量多就评论。"
             "沉默是完全正常的，宁可少说也不要硬找话说。"
             "无论是否评论，都重写一份可独立理解的累计主线摘要；允许比旧摘要更短，"
             "但不得遗漏已确认的主要人物、目标、关键转折和未解伏笔。"
             "facts 只列相对『已有关键事实』的新增信息；每条只描述一个事件、关系或状态，"
-            "不要把多个可独立成立的事件拼成一条，也不要重复已有事实。"
+            "不要把多个可独立成立的事件拼成一条。逐项对照已有关键事实：同一信息的换措辞或重复提及不输出，不能因文字不同当作新增。"
             "人物姓名、别名、定位、稳定外观和已知身份写入 character_updates，不要再作为facts重复保存。"
             "更新已有角色必须复制人物记录中的id；新角色id留空。未知姓名允许name为空，"
             "但aliases至少给出一个基于当前证据的描述性称呼。只记录玩家当前已经知道的内容，不得提前揭示身份。"
-            "若新信息明确修正旧事实，放入 fact_updates，并在 existing 中逐字复制要替换的旧事实；"
-            "证据不足时不要修正。"
+            "逐个对应画面对象与角色：姓名栏只能证明说话人，不能证明画中人身份；对象编号只在本次采样有效。"
+            "较早画面不可用于确认当前身份。缺乏明确对应时保留未知对象，不合并进已有角色。"
+            "每次人物更新附source（text/visual/text+visual/inference）、evidence_quote（逐字原文依据）、visual_object（本次对象编号，无则空）、conflict（与旧身份或属性的冲突，无则空）。"
+            "只有本轮文字明确支持画面对象的身份对应时才用text+visual；仅外貌相似不能确认。"
+            "人物更新用claims逐项提交：每条只写一个新增属性或经历，field取role/appearance/known_so_far，value写内容；"
+            "每条claim各自填写source、evidence_quote、visual_object、conflict，不复制整张旧卡。外观不能借用只提到姓名的台词作为证据。"
+            "人物归属结合本轮画面对象外观、类型、称呼关系和前后动作判断；画中人、说话人、谈论对象分别判断。"
+            "本帧姓名栏加头像对应是视觉身份线索，可与OCR姓名交叉比较；不同写法先对照已有角色，不因OCR字不同另建人物。"
+            "同名可以是不同角色，人物id才代表身份；identity_action取existing/new/uncertain。已有角色用existing和对应id，确属另一个同名角色用new，不清楚就uncertain。"
+            "OCR异字不代表新角色：结合已有外观、关系、场景连续性选择原id，保留本次识别name，不把误字当正式别名；不能只因字近就合并。"
+            "entity_type取human/animal/other/unknown，按当前证据填写。同名不同角色各写一项；不同角色的经历不属于同一人物的矛盾。"
+            "类型是当时形态，不是永不改变的身份。若本轮明确揭示两张卡其实是同一个体（包括变身或原身份揭露），在identity_links关联已有id，保留各阶段经历；不能仅凭同名或相貌相似合并。身份揭示也是本轮新事件，需要纳入反应判断。"
+            "证据必须支持所写属性而非仅提到姓名；推测标inference。确认是同一角色却存在矛盾时才填conflict。"
+            "换装、受伤属于阶段状态；读档和不同路线的经历不意味着同时发生，分支无法确认时保留不确定。"
+            "若新信息补充同一事实的细节或明确纠正旧认识，放入 fact_updates，并在 existing 中逐字复制要替换的旧事实，不再作为facts重复输出；"
+            "若是后来发生的状态变化，作为新facts保留此前与后来的时间关系，不把曾经成立的经历改成从未发生。证据不足时不要修正。"
             "viewer_notes只写第一人称、对本作品人物或关系持续有效的感受与看法，每条都要有『我』，例如『我原本怀疑他，现在有点动摇』。"
             "没有新变化就原样保留旧印象；新证据可让你改观或删去旧印象。"
             "不要把当前气氛、没看清人物关系、剧情摘要、普通过渡、未解伏笔或用户偏好写成印象；没有具体印象就填空数组，最多6条。"
-            "只输出 JSON，严格按下面字段顺序输出；先完成反应判断与comment，再整理记忆，不要在后文改写已经输出的字段："
-            '{"should_comment":false,"moment_type":"ordinary|humor|tender|twist|choice|tension|other",'
+            "只输出 JSON，严格按下面字段顺序输出；先对照新剧情更新身份关系，再选择反应与comment，最后整理其余记忆，不要在后文改写已经输出的字段："
+            '{"identity_links":[{"relation":"same_entity","character_ids":["已有id1","已有id2"],"evidence_kind":"explicit_identity或inference","evidence_quote":"本轮明确揭示身份对应的原句","identity_summary":"同一个体及其不同形态或身份的关系"}],'
+            '"reaction_basis":"引用本轮新增台词中触发反应的原句，不改写解释，没看懂就留空",'
+            '"reaction_line_id":0,'
+            '"felt_reaction":"此刻你自己想说的接话或感受；不替人物解释内心，不猜他没说出口的意思，无话就留空",'
+            '"should_comment":false,"moment_type":"ordinary|humor|tender|twist|choice|tension|other",'
             '"reaction_source":"plot|persona|both|none",'
-            '"reaction_basis":"本段可见的具体事件，没看懂就留空","felt_reaction":"准备直接说出口的原话，无须先概述剧情再总结感受，可留空",'
             '"reaction_repeats":false,'
             '"comment":"自然时逐字沿用felt_reaction，仅修正绕口、重复或事实错误，不添加停顿、转折或新判断；不想说就留空","tone_hint":"可选，一句话说明这一刻适合什么语气，没有就留空",'
             f'"scene_delta":"本段剧情新增了什么，不超过200字","scene_summary":"累计主线摘要，不超过600字",'
             '"viewer_notes":["对本作品的暂时看法"],"facts":["原子化的新事实"],"fact_updates":[{"existing":"逐字复制的旧事实","replacement":"修正后的原子事实"}],'
-            '"character_updates":[{"id":"已有id或留空","name":"允许为空","aliases":["称呼"],'
-            '"role":"当前已知定位","appearance":["稳定特征"],"known_so_far":["当前已知信息"],"confidence":0.0}]}'
-            "只有reaction_basis有本段证据、你确实想对哥哥说话时，should_comment才为true；"
-            "felt_reaction就是准备说出口的那句话：可以直接感叹、疑惑或接眼前细节，不需要凑成『描述剧情，再停顿，再讲感受』。完整接话用逗号或句号；只有话确实卡住或没有说完时才用省略号。comment自然时逐字沿用felt_reaction，不另写一条评论，不添加新的判断。事实和主观判断分清：未确认的动机保留为猜测，含糊答话或没看清本身不能证明人物在故意隐瞒。"
+            '"character_updates":[{"id":"已有id或留空","identity_action":"existing/new/uncertain","entity_type":"human/animal/other/unknown","name":"允许为空","aliases":["称呼"],'
+            '"confidence":0.0,"claims":[{"field":"role/appearance/known_so_far","value":"一条新增信息",'
+            '"source":"text/visual/text+visual/inference","evidence_quote":"原文依据","visual_object":"","conflict":""}]}]}'
+            "先有当前依据与真实接话，再决定should_comment；没有新反应或同一关注点已说过就false，继续正常整理记忆。"
         )
         prompt = "\n".join(parts)
         system_prompt = get_system_visual_novel_prompt(tutor_enabled=self._tutor_enabled)
@@ -772,12 +801,17 @@ class CommentEngine:
                     return
                 fields = self._leading_json_fields(text)
                 required = {"should_comment", "moment_type", "reaction_repeats", "comment"}
+                if context.get("reaction_line_ids"):
+                    required.add("reaction_line_id")
                 if not required <= fields.keys():
                     return
                 delivered = True
                 comment = self._truncate_text(str(fields.get("comment", "")).strip(), 100)
-                accepted = (fields["should_comment"] is True and bool(comment)
+                accepted = (local_comment_allowed and fields["should_comment"] is True and bool(comment)
                             and fields["moment_type"] != "ordinary" and fields["reaction_repeats"] is False)
+                if context.get("reaction_line_ids"):
+                    anchor = fields.get("reaction_line_id")
+                    accepted = accepted and type(anchor) is int and anchor in context["reaction_line_ids"]
                 if accepted and on_reaction is not None:
                     on_reaction({**fields, "comment": comment})
             if on_reaction is not None and hasattr(self._client, "chat_stream"):
@@ -837,7 +871,10 @@ class CommentEngine:
         output_characters = [dict(item) for item in parsed_characters[:12] if isinstance(item, dict)] if isinstance(parsed_characters, list) else []
         parsed_viewer_notes = parsed.get("viewer_notes")
         reaction_repeats = parsed.get("reaction_repeats") is True
-        accepted = bool(should_comment and comment and moment_type != "ordinary" and not reaction_repeats)
+        accepted = bool(local_comment_allowed and should_comment and comment and moment_type != "ordinary" and not reaction_repeats)
+        reaction_line_id = parsed.get("reaction_line_id")
+        if context.get("reaction_line_ids"):
+            accepted = bool(accepted and type(reaction_line_id) is int and reaction_line_id in context["reaction_line_ids"])
         if accepted:
             self._record_generated_comment(comment)
         # Which track made this moment worth raising: the plot, the character's
@@ -848,6 +885,7 @@ class CommentEngine:
             reaction_source = "none"
         result = {
             "should_comment": accepted,
+            "reaction_line_id": reaction_line_id,
             "moment_type": moment_type,
             "reaction_source": reaction_source,
             "reaction_repeats": reaction_repeats,
@@ -859,6 +897,7 @@ class CommentEngine:
             "facts": output_facts,
             "fact_updates": output_updates,
             "character_updates": output_characters,
+            "identity_links": parsed.get('identity_links', []),
             "emotion": emotion,
             "tone_hint": self._truncate_text(str(parsed.get("tone_hint", "")).strip(), 80),
         }

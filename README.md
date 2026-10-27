@@ -250,3 +250,23 @@ AUTO_COMMENT_STYLE_WEIGHTS=陪伴评论:1.2,轻松提问:0.8,俏皮打趣:0.5,�
 - OCR-first routing uses local OCR for text-rich screens, combines compact OCR with vision for mixed screens, and uses vision alone when OCR is sparse.
 - `MM_AUTO_MIN_INTERVAL_SEC` limits automatic screenshot uploads independently from the local scan interval; manual screen comments bypass this interval.
 - `MM_OUTPUT_MAX_TOKENS` and `OCR_CONTEXT_MAX_CHARS` cap the two variable-size parts of a hybrid vision request.
+
+### GPT-SoVITS local Japanese speech
+
+- Select `TTS_PROVIDER=gpt_sovits` in `.env`; the Japanese translation channel remains controlled by `TTS_TRANSLATION_PROVIDER`.
+- The local deployment uses a separate environment under `tools/gpt_sovits`, with tsumugi v2Pro Plus weights and references under `VOICE_model/GPT_weights_v2ProPlus/tsumugi`.
+- Required voice files are `tsumugi-e25.ckpt`, `tsumugi_e6_s438.pth`, `reference_01.wav`, and `references.json`. Model files and the runtime are not included in Git.
+- `config/gpt_sovits_tsumugi.yaml` selects CUDA half precision. Reference audio/text and API address are configured through the `TTS_GPT_SOVITS_*` entries in `.env.example`.
+- Launch `pet.bat` to start the speech service first. When launching `main.py` directly, run `scripts/start_gpt_sovits.ps1` first; also start `scripts/start_index_translation.ps1` if selecting local Index translation.
+- Initial service startup includes synthesis warmup, so the first comment does not pay the audio initialization cost. M2M100 translation still loads only on actual use.
+- GPT-SoVITS plays the first segment while synthesizing the next, using sentence and long-clause boundaries. Set `TTS_GPT_SOVITS_SEGMENTED=false` and restart the pet to restore whole-comment synthesis; translation still runs once per comment.
+- The API listens on `127.0.0.1:9880`. The service persists after closing the pet; `scripts/stop_gpt_sovits.ps1` stops the instance launched by this project.
+- To return to VOICEVOX, set `TTS_PROVIDER=voicevox`, stop GPT-SoVITS, and restart the pet. Existing VOICEVOX files and settings are preserved.
+
+### Visual-novel comment filter selection
+
+- Hover over the visual-novel control and open the fourth menu entry, `模型设置`, to switch between the original 24-line memory batching with semantic triggering, `window-linear-v64`, and the BGE target-pooling + GRU binary filter.
+- Choices take effect immediately and are saved as `VN_REACTION_FILTER_MODEL` in the local `.env`: `semantic`, `window-linear-v64`, or `target-gru-fusion-r8`. Leaving this value empty preserves `ENABLE_VN_REACTION_CLASSIFIER` behavior.
+- The new filter uses `fusion_20261028`, selected by minimum validation BCE, with its validation FIR5 threshold of `0.3507848381996155`. It predicts speak/silence; the remote comment generator still decides whether and how to respond.
+- Model assets remain outside Git. The existing filter needs `assets/models/vn-reaction-v64` (BGE ONNX encoder, tokenizer, `head.npz`, and `classifier.json`). The new filter also needs `assets/models/vn-reaction-fusion-r8/head.onnx` and `classifier.json`, and shares the existing BGE encoder. If assets are missing or loading fails, the sidebar reports the failure and uses semantic filtering.
+- Switching filters invalidates pending comments from the old selection. All choices retain plot-memory updates and the existing comment cooldown.

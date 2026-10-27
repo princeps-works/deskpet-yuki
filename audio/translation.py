@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import threading
+import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -106,6 +107,7 @@ class JapaneseTranslationService:
         self._api_model = str(getattr(settings, "model_name", "default"))
         # Only this public translation endpoint uses a direct connection.
         self._index_opener = build_opener(ProxyHandler({}))
+        self._index_retry_after = 0.0
 
         self._lock = threading.RLock()
         self._translator = None
@@ -342,6 +344,7 @@ class JapaneseTranslationService:
 
         translated = ""
         cache_result = True
+        index_failed = False
         if self._provider == "local":
             try:
                 translated = self._translate_local(source)
@@ -352,7 +355,11 @@ class JapaneseTranslationService:
         elif self._provider == "api":
             translated = self._translate_api(source)
         elif self._provider in {"index", "index_local"}:
-            translated = self._translate_index(source)
+            if time.monotonic() >= self._index_retry_after:
+                translated = self._translate_index(source)
+                index_failed = not translated
+            else:
+                self._diag_log("Index recovery backoff; using local model")
             if not translated:
                 # Do not save a local fallback as an Index result.
                 cache_result = False
@@ -365,9 +372,13 @@ class JapaneseTranslationService:
 
         translated = _normalize_translation(translated, self._max_chars)
         if not is_safe_japanese_tts_text(translated, source_had_han=source_had_han):
+            self._index_retry_after = 0.0  # A failing fallback must not prevent endpoint recovery.
             self._diag_log("translation rejected: Japanese kana missing or source text leaked")
             return "" if self._skip_on_failure else source
 
+        if index_failed:
+            # Only back off once a usable local fallback has actually succeeded.
+            self._index_retry_after = time.monotonic() + 30.0
         if cache_result:
             self._put_cached(source, translated)
         return translated

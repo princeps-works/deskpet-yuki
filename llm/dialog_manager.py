@@ -6,6 +6,7 @@ import ipaddress
 import re
 import threading
 import time
+import uuid
 from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass
@@ -20,6 +21,7 @@ from desktop_pet.config.prompts import INITIAL_PERSONA, get_system_chat_prompt
 from desktop_pet.llm.client import LLMClient
 from desktop_pet.llm.memory_store import MemoryStore
 from desktop_pet.llm.semantic_attention import SemanticAttentionRouter
+from desktop_pet.llm.history_archive import HistoryArchive
 
 
 _WEB_OPENER = build_opener(ProxyHandler({}))
@@ -65,8 +67,10 @@ class DialogManager:
         self._memory_path = memory_path
         self._personalization_path = memory_path.with_name("personalization.json")
         self._session_messages: list[dict[str, object]] = []
+        self._session_archive = HistoryArchive(memory_path.with_suffix('.sessions.sqlite3'))
         self._session_lock = threading.Lock()
         self._session_segment_id = 1
+        self._archive_segment_key = uuid.uuid4().hex
         self._tutor_enabled = bool(tutor_enabled)
         self._web_search_enabled = False
         self._last_reply_web_status = "off"
@@ -114,12 +118,21 @@ class DialogManager:
     def _load_memory_entries(self) -> list[dict[str, object]]:
         return self._memory_store.list_diaries()
 
+    def _current_memory_scope(self) -> str:
+        tracker = getattr(self._visual_novel_context_provider, "__self__", None)
+        path = getattr(tracker, "path", None)
+        return "story:" + str(Path(path).resolve()).casefold() if path else "user"
+
+    def _recall_scopes(self) -> tuple[str, ...]:
+        scope = self._current_memory_scope()
+        return ("user", scope) if scope != "user" else ("user", "legacy")
+
     def _build_long_memory_block(self, query: str = "") -> str:
         if str(query or "").strip():
             entries = self._rank_memory_candidates(query, top_k=6)
         else:
-            valid = [entry for entry in self._load_memory_entries() if not self._memory_is_expired(entry)]
-            entries = list(reversed(valid[-self._long_memory_context_window :]))
+            entries = self._memory_store.candidates("", limit=self._long_memory_context_window,
+                                                    scopes=self._recall_scopes())[:self._long_memory_context_window]
         if not entries:
             return ""
         lines = [self._memory_context_line(item) for item in entries]
@@ -129,9 +142,16 @@ class DialogManager:
         try:
             data = json.loads(self._personalization_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            return []
+            data = {}
         raw = data.get("preferences", []) if isinstance(data, dict) else []
-        return [item for item in raw if isinstance(item, dict) and item.get("topic") and item.get("preference")][-8:] if isinstance(raw, list) else []
+        scopes = self._recall_scopes()
+        entries = [item for item in raw if isinstance(item, dict) and item.get("topic") and item.get("preference")
+                   and item.get("scope", "user") in scopes] if isinstance(raw, list) else []
+        for item in self._memory_store.personalizations(scopes=self._recall_scopes()):
+            key = self._preference_key(str(item.get("topic", "")))
+            entries = [entry for entry in entries if self._preference_key(str(entry.get("topic", ""))) != key]
+            entries.append(item)
+        return entries[-8:]
 
     def build_personalization_hint(self) -> str:
         entries = self._load_personalization()
@@ -140,18 +160,17 @@ class DialogManager:
         lines = [f"- {item['topic']}：{item['preference']}" for item in entries[-5:]]
         return "哥哥明确表达的长期互动偏好（当前要求优先；不要当作剧情事实）：\n" + "\n".join(lines)
 
-    def _record_personalization(self, raw_items: object, transcript: str) -> None:
+    def _validated_personalization(self, raw_items: object, transcript: str, *, scope: str | None = None) -> list[dict]:
         if not isinstance(raw_items, list):
-            return
+            return []
         user_words = re.sub(r"\s+", " ", "\n".join(
             line.removeprefix("你: ").strip()
             for line in transcript.splitlines()
             if line.startswith("你: ")
         )).strip()
         if not user_words:
-            return
-        entries = self._load_personalization()
-        changed = False
+            return []
+        entries = []
         for item in raw_items[:6]:
             if not isinstance(item, dict):
                 continue
@@ -160,15 +179,38 @@ class DialogManager:
             quote = re.sub(r"\s+", " ", str(item.get("evidence_quote") or "")).strip()[:160]
             if not topic or not preference or len(quote) < 4 or quote not in user_words:
                 continue
-            entries = [entry for entry in entries if str(entry.get("topic", "")).casefold() != topic.casefold()]
-            entries.append({"topic": topic, "preference": preference, "evidence_quote": quote, "updated_at": self._now_iso()})
-            changed = True
-        if not changed:
+            key = self._preference_key(topic)
+            entries = [entry for entry in entries
+                       if self._preference_key(str(entry.get("topic", ""))) != key
+                       and str(entry.get("preference", "")).strip() != preference]
+            preference_scope = "user" if item.get("scope") == "user" else (scope or self._current_memory_scope())
+            entries.append({"topic": topic, "preference": preference, "evidence_quote": quote,
+                            "scope": preference_scope, "updated_at": self._now_iso()})
+        return entries
+
+    def _record_personalization(self, raw_items: object, transcript: str) -> None:
+        validated = self._validated_personalization(raw_items, transcript)
+        if not validated:
             return
+        try:
+            entries = json.loads(self._personalization_path.read_text(encoding="utf-8")).get("preferences", [])
+        except (OSError, ValueError):
+            entries = []
+        for item in validated:
+            entries = [entry for entry in entries if (entry.get("scope", "user"), self._preference_key(str(entry.get("topic", ""))))
+                       != (item["scope"], self._preference_key(item["topic"]))]
+            entries.append(item)
         self._personalization_path.parent.mkdir(parents=True, exist_ok=True)
         temp_path = self._personalization_path.with_suffix(".json.tmp")
         temp_path.write_text(json.dumps({"version": 1, "preferences": entries[-8:]}, ensure_ascii=False, indent=2), encoding="utf-8")
         temp_path.replace(self._personalization_path)
+
+    @staticmethod
+    def _preference_key(topic: str) -> str:
+        value = str(topic).strip().casefold()
+        if "评论" in value and not re.search(r"剧透|频率|时机", value):
+            return "comment_style"
+        return value
 
     def build_light_long_memory_hint(self, limit: int = 3, query: str = "") -> str:
         """Short long-term memory block for automatic comments.
@@ -184,7 +226,7 @@ class DialogManager:
             # highest-weighted part.
             entries = self._rank_memory_candidates(query_text[:280], top_k=max(1, limit))
         else:
-            entries = self._memory_store.candidates("", limit=max(20, limit * 4))[: max(1, limit)]
+            entries = self._memory_store.candidates("", limit=max(20, limit * 4), scopes=self._recall_scopes())[: max(1, limit)]
         if not entries:
             return ""
 
@@ -225,7 +267,8 @@ class DialogManager:
         freshness = str(entry.get("freshness") or "unknown")
         confidence = cls._clamp_confidence(entry.get("confidence"), 0.45)
         summary = re.sub(r"\s+", " ", str(entry.get("summary") or "")).strip()
-        return f"- [slot={slot}|confidence={confidence:.2f}|freshness={freshness}] {summary}"
+        scope_kind = str(entry.get("scope", "")).split(":", 1)[0]
+        return f"- [memory_id={entry.get('id', '')}|scope={scope_kind}|slot={slot}|confidence={confidence:.2f}|freshness={freshness}] {summary}"
 
     @classmethod
     def _memory_lexical_score(cls, query: str, entry: dict[str, object]) -> float:
@@ -266,11 +309,12 @@ class DialogManager:
             if cached is None:
                 missing_indexes.append(index)
                 missing_texts.append(text)
-        if missing_texts:
-            encoded = router.embeddings(missing_texts)
-            if encoded is None or len(encoded) != len(missing_texts):
+        for start in range(0, len(missing_texts), 32):
+            batch = missing_texts[start:start + 32]
+            encoded = router.embeddings(batch)
+            if encoded is None or len(encoded) != len(batch):
                 return None
-            for index, vector in zip(missing_indexes, encoded):
+            for index, vector in zip(missing_indexes[start:start + 32], encoded):
                 vectors[index] = vector
                 self._memory_store.save_embedding(
                     int(entries[index].get("id") or 0),
@@ -286,6 +330,16 @@ class DialogManager:
             scores.append(max(0.0, min(1.0, float(vector @ query_vector))))
         return scores
 
+    @classmethod
+    def _recall_rank(cls, query: str, entry: dict[str, object], semantic: float,
+                     recency: float = 0.0) -> tuple[float, bool]:
+        lexical = cls._memory_lexical_score(query, entry)
+        score = (0.50 * semantic + 0.25 * lexical
+                 + 0.10 * cls._clamp_confidence(entry.get("importance"), 0.50)
+                 + 0.10 * cls._clamp_confidence(entry.get("confidence"), 0.45)
+                 + 0.05 * recency)
+        return score, semantic >= 0.34 or lexical >= 0.10
+
     def _rank_memory_candidates(
         self,
         query: str,
@@ -293,36 +347,25 @@ class DialogManager:
         top_k: int,
     ) -> list[dict[str, object]]:
         query_text = str(query or "").strip()
+        scopes = self._recall_scopes()
         if not query_text:
-            return self._memory_store.candidates("", limit=max(20, top_k))[: max(1, top_k)]
+            return self._memory_store.candidates("", limit=max(20, top_k), scopes=scopes)[: max(1, top_k)]
         candidates = self._memory_store.candidates(
             query_text,
-            limit=max(80, self._long_memory_context_window * 3),
+            # Semantic matching must see old memories even without lexical overlap.
+            limit=None if self._semantic_attention is not None else max(80, self._long_memory_context_window * 3),
+            scopes=scopes,
         )
         if not candidates:
             return []
         semantic_scores = self._memory_semantic_scores(query_text, candidates)
-        recall_query = any(marker in query_text for marker in ("记得", "上次", "以前", "之前", "我喜欢", "我的"))
-        total = max(1, len(candidates))
         ranked: list[tuple[float, dict[str, object]]] = []
         for index, entry in enumerate(candidates):
             semantic = semantic_scores[index] if semantic_scores is not None else 0.0
-            lexical = self._memory_lexical_score(query_text, entry)
-            confidence = self._clamp_confidence(entry.get("confidence"), 0.45)
-            importance = self._clamp_confidence(entry.get("importance"), 0.50)
-            recency = 1.0 - index / total
-            score = (
-                0.50 * semantic
-                + 0.25 * lexical
-                + 0.10 * importance
-                + 0.10 * confidence
-                + 0.05 * recency
-            )
-            relevant = semantic >= 0.34 or lexical >= 0.10
-            if recall_query and index < self._long_memory_context_window:
-                relevant = True
+            score, relevant = self._recall_rank(query_text, entry, semantic)
             if relevant:
                 ranked.append((score, entry))
+        # Recency breaks ties; it must not displace a better old match.
         ranked.sort(
             key=lambda item: (
                 -item[0],
@@ -330,7 +373,14 @@ class DialogManager:
                 -int(item[1].get("id") or 0),
             )
         )
-        selected = [entry for _, entry in ranked[: max(1, int(top_k))]]
+        selected = []
+        for _, entry in ranked:
+            # Inference may have overlapped a correction; recheck before using a cached candidate.
+            evidence = self._memory_store.read_evidence(int(entry["id"]), scopes=scopes)
+            if evidence["status"] == "success":
+                selected.append(evidence["memory"])
+            if len(selected) >= max(1, int(top_k)):
+                break
         self._memory_store.mark_recalled(int(entry.get("id") or 0) for entry in selected)
         return selected
 
@@ -353,18 +403,89 @@ class DialogManager:
             f"memory_prefetch=hybrid_sqlite;selected={len(entries)}",
         )
 
+    def _session_in_scope(self, item: dict, *, archived: bool = False) -> bool:
+        metadata = item.get("metadata", {})
+        if metadata.get("archive_key") and not self._memory_store.archive_is_current(metadata["archive_key"]):
+            return False
+        if metadata.get("memory_scope"):
+            return metadata["memory_scope"] == self._current_memory_scope()
+        tracker = getattr(self._visual_novel_context_provider, '__self__', None)
+        current_story = getattr(tracker, 'story_title', '')
+        stored_story = item.get('metadata', {}).get('story', '')
+        if archived and current_story:
+            return False  # A legacy title alone cannot identify two same-named works.
+        if stored_story:
+            return stored_story == current_story
+        # Legacy archived messages have no reliable work identity. Keep them
+        # on disk, but do not import them into a named story's conversation.
+        return not (archived and current_story)
+
     def _build_recent_session_block(self) -> str:
         with self._session_lock:
             if not self._session_messages:
                 return ""
-            picked = list(self._session_messages[-120:])
+            chat_indexes = [
+                index for index, item in enumerate(self._session_messages)
+                if self._session_in_scope(item) and item.get("role") in {"你", "桌宠", "user", "assistant"}
+            ][-4:]
+            comment_indexes = [index for index, item in enumerate(self._session_messages)
+                               if self._session_in_scope(item) and item.get("role") in {"桌宠(视觉小说)", "桌宠(自动)"}][-3:]
+            picked = [self._session_messages[index]
+                      for index in sorted(chat_indexes + comment_indexes)]
         lines: list[str] = []
         for item in picked:
             role = item.get("role", "")
             text = item.get("text", "")
             if role and text:
-                lines.append(f"{role}: {text}")
+                lines.append(f"{role}: {str(text)[:120]}")
         return "\n".join(lines)
+
+    def _build_session_recall_block(self, query: str) -> str:
+        similarities = getattr(self._semantic_attention, "similarities", None)
+        with self._session_lock:
+            chats = [i for i, item in enumerate(self._session_messages)
+                     if self._session_in_scope(item) and item.get("role") in {"你", "桌宠", "user", "assistant"}]
+            comments = [i for i, item in enumerate(self._session_messages)
+                        if self._session_in_scope(item) and item.get("role") in {"桌宠(视觉小说)", "桌宠(自动)"}]
+            recent = set(chats[-4:] + comments[-3:])
+            candidates = [dict(self._session_messages[i])
+                          for i in sorted(chats + comments) if i not in recent]
+            recent_texts = {(self._session_messages[i]['role'], self._session_messages[i]['text']) for i in recent}
+        known = {(item['role'], item['text']) for item in candidates}
+        for row in self._session_archive.rows():
+            item = row['payload']
+            if not self._session_in_scope(item, archived=True):
+                continue
+            pair = (item.get('role'), item.get('text'))
+            if pair not in known and pair not in recent_texts:
+                candidates.append(item)
+                known.add(pair)
+        if not candidates:
+            return ""
+        texts = [str(item.get("text", "")) for item in candidates]
+        scores = self._session_archive.similarities(query, texts, similarities)
+        ranked = []
+        for index, text in enumerate(texts):
+            score, relevant = self._recall_rank(
+                query, {"summary": text}, scores[index] if scores is not None else 0.0,
+                (index + 1) / len(texts),
+            )
+            if relevant:
+                ranked.append((score, index))
+        selected = []
+        seen = set()
+        remaining = 500
+        for _, index in sorted(ranked, reverse=True):
+            text = texts[index].strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            line = f"{candidates[index]['role']}: {text[:240]}"
+            if len(line) + 1 > remaining:
+                continue
+            selected.append(line)
+            remaining -= len(line) + 1
+        return "\n".join(selected)
 
     @staticmethod
     def _truncate_text(text: str, max_chars: int) -> str:
@@ -381,7 +502,7 @@ class DialogManager:
         with self._session_lock:
             if not self._session_messages:
                 return ""
-            picked = list(self._session_messages[-max_items:])
+            picked = [item for item in self._session_messages if self._session_in_scope(item)][-max_items:]
         lines: list[str] = []
         for item in picked:
             role = str(item.get("role", "")).strip()
@@ -396,6 +517,7 @@ class DialogManager:
         with self._session_lock:
             self._session_messages = []
             self._session_segment_id = 1
+            self._archive_segment_key = uuid.uuid4().hex
             self._recent_explicit_urls = []
         return len(self._load_memory_entries())
 
@@ -674,8 +796,20 @@ class DialogManager:
         item: dict[str, object] = {"role": role_text, "text": content}
         if metadata:
             item["metadata"] = dict(metadata)
+        tracker = getattr(self._visual_novel_context_provider, '__self__', None)
+        story = getattr(tracker, 'story_title', '')
+        if story:
+            item.setdefault('metadata', {}).setdefault('story', story)
+        if role_text in {'你', 'user'} and re.search(r'(?:又|重新|刚才|现在|已经).{0,4}读档|读档了', content):
+            if callable(getattr(tracker, 'mark_reload', None)):
+                tracker.mark_reload(content)
         with self._session_lock:
+            scope = self._current_memory_scope()
+            item.setdefault("metadata", {}).setdefault("memory_scope", scope)
+            item["metadata"].setdefault("archive_key", self._archive_segment_key + ":" + item["metadata"]["memory_scope"])
             self._session_messages.append(item)
+        self._session_archive.add('会话', content, item,
+                                  key=f'{time.time_ns()}')
 
     @staticmethod
     def _build_transcript_from_messages(messages: list[dict[str, object]]) -> str:
@@ -757,16 +891,30 @@ class DialogManager:
             snapshot = list(self._session_messages)
             self._session_messages = []
             self._session_segment_id += 1
+            self._archive_segment_key = uuid.uuid4().hex
         transcript = self._build_transcript_from_messages(snapshot)
         if transcript:
             evidence_key = hashlib.sha256(transcript.encode("utf-8")).hexdigest()
-            evidence = self._build_archive_evidence(snapshot)
+            groups: dict[str, list[dict]] = {}
+            for item in snapshot[-120:]:
+                groups.setdefault(str(item.get("metadata", {}).get("memory_scope") or "legacy"), []).append(item)
+            batches = []
+            for scope, messages in groups.items():
+                text = self._build_transcript_from_messages(messages)
+                source_key = str(messages[0].get("metadata", {}).get("archive_key") or "")
+                archive = self._memory_store.prepare_archive(text, scope, source_key=source_key)
+                batches.append({"transcript": text, "archive": archive,
+                                "evidence": self._build_archive_evidence(messages)})
             with self._session_lock:
-                self._pending_archive_evidence[evidence_key] = evidence
-                if len(self._pending_archive_evidence) > 8:
-                    oldest = next(iter(self._pending_archive_evidence))
-                    self._pending_archive_evidence.pop(oldest, None)
+                self._pending_archive_evidence[evidence_key] = {"batches": batches}
         return transcript
+
+    def pop_archive_snapshot(self) -> dict:
+        transcript = self.pop_current_session_transcript()
+        key = hashlib.sha256(transcript.encode("utf-8")).hexdigest()
+        with self._session_lock:
+            evidence = self._pending_archive_evidence.pop(key, {})
+        return {"transcript": transcript, "evidence": evidence}
 
     @staticmethod
     def _infer_memory_freshness(text: str) -> str:
@@ -785,9 +933,20 @@ class DialogManager:
             return "stable"
         return "unknown"
 
-    def archive_transcript(self, transcript: str) -> str:
+    def archive_transcript(self, transcript: str, *, archive: dict | None = None,
+                           evidence: dict | None = None) -> str:
         transcript = str(transcript or "").strip()
         if not transcript:
+            return ""
+        if evidence is None:
+            key = hashlib.sha256(transcript.encode("utf-8")).hexdigest()
+            with self._session_lock:
+                evidence = self._pending_archive_evidence.pop(key, {})
+        if "batches" in evidence:
+            return "\n".join(filter(None, (self.archive_transcript(**batch) for batch in evidence["batches"])))
+        if archive is None:
+            archive = self._memory_store.prepare_archive(transcript, self._current_memory_scope())
+        if archive.get("cancelled") or archive.get("committed_id") is not None:
             return ""
 
         summary_prompt = (
@@ -800,7 +959,7 @@ class DialogManager:
             "不从桌宠回复、自动评论或剧情台词推断用户偏好；同一主题的纠正沿用原topic。"
             "只输出一个JSON对象，不要Markdown。格式："
             '{"summary":"日记正文","topics":["主题1","主题2"],'
-            '"personalization":[{"topic":"偏好主题","preference":"希望桌宠怎样互动","evidence_quote":"用户原话"}],'
+            '"personalization":[{"topic":"偏好主题","preference":"希望桌宠怎样互动","evidence_quote":"用户原话","scope":"user或context"}],'
             '"freshness":"stable或volatile或unknown","facts":['
             '{"subject":"主体","predicate":"关系或属性","object":"值",'
             '"slot":"user_profile或relationship或current_state或knowledge",'
@@ -810,6 +969,7 @@ class DialogManager:
             "新闻、当前局势、价格、天气、软件版本等易变化事实为volatile；无法确定为unknown。"
             "current_state默认replace；经历、关系事件和作品知识通常append；"
             "只有用户明确说请记住、永远记住时才把pinned设为true。最多8条facts。"
+            "personalization的scope：明确跨作品适用的长期互动偏好用user；只针对当前作品、任务或无法确定范围时用context。"
         )
         payload: dict[str, object] = {}
         try:
@@ -855,9 +1015,6 @@ class DialogManager:
             # changing facts must never be made stable by a planner mistake.
             freshness = "volatile"
 
-        evidence_key = hashlib.sha256(transcript.encode("utf-8")).hexdigest()
-        with self._session_lock:
-            evidence = self._pending_archive_evidence.pop(evidence_key, {})
         created_at = self._now_iso()
         expires_at = ""
         if freshness == "volatile":
@@ -868,6 +1025,8 @@ class DialogManager:
         last_verified_at = str(evidence.get("last_verified_at") or "")
 
         diary_entry = {
+            "scope": archive["scope"],
+            "personalization": self._validated_personalization(payload.get("personalization"), transcript, scope=archive["scope"]),
             "schema_version": 3,
             "timestamp": created_at,
             "created_at": created_at,
@@ -882,9 +1041,8 @@ class DialogManager:
         }
         raw_facts = payload.get("facts")
         facts = raw_facts[:8] if isinstance(raw_facts, list) else []
-        self._memory_store.add_diary(diary_entry, facts)
-        self._record_personalization(payload.get("personalization"), transcript)
-        return summary
+        committed = self._memory_store.add_diary(diary_entry, facts, source_transcript=transcript, archive=archive)
+        return summary if committed is not None else ""
 
     def set_tutor_enabled(self, enabled: bool) -> None:
         self._tutor_enabled = bool(enabled)
@@ -2868,11 +3026,11 @@ class DialogManager:
         if not default_greeting:
             default_greeting = "哥哥，欢迎回来，我在这陪你。"
 
-        entries = [entry for entry in self._load_memory_entries() if not self._memory_is_expired(entry)]
+        entries = self._memory_store.candidates("", limit=20, scopes=self._recall_scopes())[:3]
         if not entries:
             return default_greeting
 
-        picked = entries[-3:]
+        picked = entries
         memory_lines = [f"- {item.get('summary', '').strip()}" for item in picked if str(item.get("summary", "")).strip()]
         if not memory_lines:
             return default_greeting
@@ -2958,6 +3116,7 @@ class DialogManager:
         created_at = self._now_iso()
         summary = f"《{title}》剧情进展：{body}" if body else f"《{title}》剧情记录"
         entry = {
+            "scope": "story-title:" + title,
             "schema_version": 3,
             "timestamp": created_at,
             "created_at": created_at,
@@ -2999,15 +3158,25 @@ class DialogManager:
         extra_context_max_chars: int | None = None,
         prepared_web_search: tuple[str, str] | None = None,
     ) -> str:
+        reply_scope = self._current_memory_scope()
+        tracker = getattr(self._visual_novel_context_provider, "__self__", None)
+        reply_story = getattr(tracker, "story_title", "")
         long_memory = self._build_long_memory_block(user_text)
         personalization_hint = self.build_personalization_hint()
         recent_session = self._build_recent_session_block()
+        session_recall = self._build_session_recall_block(user_text)
+        novel_query = user_text
+        if recent_session:
+            novel_query += "\n最近对话中的指代线索（仅供检索）：\n" + recent_session
         visual_novel_context = ""
         if callable(self._visual_novel_context_provider):
             try:
-                visual_novel_context = str(self._visual_novel_context_provider(user_text) or "").strip()
+                visual_novel_context = str(self._visual_novel_context_provider(novel_query) or "").strip()
             except Exception:
                 visual_novel_context = ""
+        novel_identity = ""
+        if visual_novel_context.startswith("当前作品: "):
+            novel_identity, _, visual_novel_context = visual_novel_context.partition("\n")
         now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         web_enabled = bool(self._web_search_enabled)
         if web_enabled and prepared_web_search is not None:
@@ -3020,23 +3189,19 @@ class DialogManager:
         web_status = "hit" if used_web else ("skipped" if web_enabled and local_skip else ("miss" if web_enabled else "off"))
         web_confidence = self._web_confidence_from_debug(web_debug, used_web=used_web)
         snippet_only = self._web_debug_field(web_debug, "evidence_level") == "snippet_only"
-        is_character_query = self._is_character_query(user_text)
 
         # Weighted fusion: prioritize current intent and web facts, demote memory to avoid narrative drift.
-        user_core = self._truncate_text(user_text, 240)
+        user_core = user_text
         visual_context = str(extra_context_kind or "").strip().lower() in {"screen", "image", "visual"}
-        if is_character_query:
-            web_budget = 1500
-            recent_budget = 260
-            memory_budget = 360
-            extra_budget = 200
-        else:
-            web_budget = 1200
-            recent_budget = 520
-            memory_budget = 320
-            extra_budget = 280
+        web_budget = 1200
+        recent_budget = 520
+        memory_budget = 360
+        extra_budget = 280
         if extra_context_max_chars is not None:
             extra_budget = max(80, min(6000, int(extra_context_max_chars)))
+        # Keep both bounded channels: automatic remarks must not be dropped
+        # again by the old chat-only character budget.
+        recent_budget = max(recent_budget, min(1000, len(recent_session)))
         context_budgets = {
             "web": web_budget,
             "recent": recent_budget,
@@ -3080,10 +3245,16 @@ class DialogManager:
                 if str(text or "").strip()
             }
         web_core = routed_contexts.get("web", "")
-        recent_core = routed_contexts.get("recent", "")
-        memory_core = routed_contexts.get("memory", "")
+        recent_core = recent_session[-recent_budget:].strip()
+        # Memory is already scoped, lifecycle-checked and ranked. Re-embedding formatted
+        # metadata can discard the strongest evidence (just as with the story provider).
+        memory_core = self._truncate_text(long_memory, memory_budget)
         extra_core = routed_contexts.get("extra", "")
-        novel_core = routed_contexts.get("novel", "")
+        # The provider already ranks evidence; a second chunk selection can
+        # discard the identity record while retaining a contradictory fragment.
+        novel_core = visual_novel_context[:900]
+        if novel_core and novel_identity:
+            novel_core = novel_identity + "\n" + novel_core
 
         if visual_context and web_status == "hit":
             web_weight = 0.14 + 0.16 * web_confidence
@@ -3103,24 +3274,14 @@ class DialogManager:
                 "extra": 0.31,
             }
         elif web_status == "hit":
-            if is_character_query:
-                web_weight = 0.24 + 0.22 * web_confidence
-                weights = {
-                    "user": 0.90 - web_weight,
-                    "web": web_weight,
-                    "recent": 0.06,
-                    "memory": 0.02,
-                    "extra": 0.02,
-                }
-            else:
-                web_weight = 0.16 + 0.18 * web_confidence
-                weights = {
-                    "user": 0.84 - web_weight,
-                    "web": web_weight,
-                    "recent": 0.10,
-                    "memory": 0.04,
-                    "extra": 0.02,
-                }
+            web_weight = 0.16 + 0.18 * web_confidence
+            weights = {
+                "user": 0.84 - web_weight,
+                "web": web_weight,
+                "recent": 0.10,
+                "memory": 0.04,
+                "extra": 0.02,
+            }
         else:
             weights = {
                 "user": 0.68,
@@ -3134,10 +3295,7 @@ class DialogManager:
 
         prompt_parts: list[str] = []
         prompt_parts.append(f"当前时间: {now_text}")
-        prompt_parts.append(
-            "信息融合规则：请按权重综合信息，不要平均采纳。"
-            "当高权重信息与低权重信息冲突时，优先高权重。"
-        )
+        prompt_parts.append("信息融合规则：结合相关上下文回答当前输入。")
 
         prompt_parts.append(f"[高优先|权重{weights['user']:.2f}] 当前用户输入:\n{user_core}")
         if personalization_hint:
@@ -3152,13 +3310,18 @@ class DialogManager:
             )
             if snippet_only:
                 prompt_parts.append("本轮只有搜索摘要，尚未核实网页正文；摘要没有直接给出的细节必须说明暂无法确认。")
-            if is_character_query:
-                prompt_parts.append("人物问答约束：优先从联网检索参考中提取人名列表；若证据不足，请明确说“当前抓取内容不足以确认全部人物”，不要猜测。")
         elif web_status == "miss":
             prompt_parts.append("[联网状态] 本次已尝试检索但未命中可用结果，不要说自己不能联网。")
 
+        if session_recall:
+            prompt_parts.append("与本轮相关的较早会话：\n" + session_recall)
         if recent_core:
             prompt_parts.append(f"[中优先|权重{weights['recent']:.2f}] 近期会话:\n{recent_core}")
+            prompt_parts.append(
+                "对话连续性：先结合最近聊天理解‘这里面、他们、这个’等指代，再回答当前输入。"
+                "若前文正在讨论作品，承接该作品；用户明确换话题时以新话题为准。"
+                "之前的回答只是对话线索，不是已核实事实；无法确定所指时简短询问，不泛化成其他话题。"
+            )
         if memory_core:
             prompt_parts.append(f"[低优先|权重{weights['memory']:.2f}] 长期记忆:\n{memory_core}")
         if novel_core:
@@ -3178,6 +3341,7 @@ class DialogManager:
                 prompt_parts.append(f"[低优先|权重{weights['extra']:.2f}] 额外上下文:\n{extra_core}")
 
         prompt_parts.append("输出要求：简短回答，默认不超过120字；除非用户明确要求详细。")
+        prompt_parts.append("记忆边界：未找到相关记录不等于用户从未说过。没有证据时只表达『我没找到相关记录』或『我不记得』；不要接『你没告诉过我』，也不要用反问暗示用户从未说过。不编造个人信息。")
         merged_user_text = "\n\n".join(prompt_parts)
 
         system_prompt = get_system_chat_prompt(tutor_enabled=self._tutor_enabled)
@@ -3213,6 +3377,8 @@ class DialogManager:
             user_text,
             metadata={
                 "source_type": "user",
+                "memory_scope": reply_scope,
+                "story": reply_story,
                 "confidence": 0.95,
                 "reference": f"session:{self.get_current_session_segment_id()}",
             },
@@ -3237,6 +3403,8 @@ class DialogManager:
             reply,
             metadata={
                 "source_type": reply_source,
+                "memory_scope": reply_scope,
+                "story": reply_story,
                 "confidence": reply_confidence,
                 "retrieved_at": retrieved_at,
                 "urls": reply_urls,

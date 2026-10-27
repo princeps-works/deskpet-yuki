@@ -97,3 +97,37 @@ def test_launcher_pid_is_initialised_before_the_runtime_probe():
     assert "_voicevox_engine_pid = 0" in init, (
         "the field must exist before _compute_runtime_ok() can launch the engine"
     )
+
+def test_other_tts_providers_do_not_enumerate_voicevox_processes():
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    import os
+    import time
+
+    for provider in ['gpt_sovits', 'edge', 'azure', 'voicevox']:
+        node = next(n for n in ast.walk(ast.parse(_SOURCE)) if isinstance(n, ast.FunctionDef) and n.name == '_apply_runtime_resource_policy')
+        for index, statement in enumerate(node.body):
+            if isinstance(statement, ast.Nonlocal):
+                node.body[index] = ast.Global(names=statement.names)
+        enumerations = []
+        policies = []
+        proc = SimpleNamespace(is_running=lambda: True, nice=lambda value: policies.append(value), cpu_affinity=lambda value: None)
+        psutil = SimpleNamespace(IDLE_PRIORITY_CLASS=1, BELOW_NORMAL_PRIORITY_CLASS=2, NORMAL_PRIORITY_CLASS=3,
+                                 ABOVE_NORMAL_PRIORITY_CLASS=4, Process=lambda pid: proc,
+                                 process_iter=lambda **kwargs: enumerations.append(kwargs) or [])
+        env = dict(os=SimpleNamespace(name='nt', getpid=os.getpid), time=time,
+                   settings=SimpleNamespace(tts_provider=provider, enable_scan_subprocess=False),
+                   state={}, speech=SimpleNamespace(voicevox_engine_pid=0), live2d_py_process=None,
+                   resource_policy_last_apply_ts=0., resource_policy_last_mode='', resource_policy_last_switch_ts=0.,
+                   resource_policy_follow_grace_until_ts=0., resource_policy_drag_grace_until_ts=0.,
+                   voicevox_pid_cache=0, voicevox_policy_last_scan_ts=0., resource_policy_reapply_min_sec=1.,
+                   resource_policy_heavy_scan_interval_sec=20., proc_policy_cache={}, all_cpu_ids=[0,1],
+                   app_cpu_ids=[], scan_cpu_ids=[], log_heartbeat=lambda *args: None)
+        ast.fix_missing_locations(node)
+        exec(compile(ast.Module(body=[node], type_ignores=[]), 'main.py', 'exec'), env)
+        with patch.dict('sys.modules', {'psutil': psutil}):
+            env['_apply_runtime_resource_policy'](False, force=True)
+            env['_apply_runtime_resource_policy'](True, force=True)
+        assert len(enumerations) == (1 if provider == 'voicevox' else 0)
+        assert policies, 'main process policy must still be applied'
+        assert env['resource_policy_last_mode'] == 'ocr_priority'

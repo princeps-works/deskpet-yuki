@@ -29,9 +29,11 @@ def test_diary_personalization_accepts_only_user_quotes_and_replaces_corrections
         assert "喜欢剧透" not in hint
 
         manager.archive_transcript("你: 改成更常问我怎么看。")
-        stored = json.loads((Path(temp_dir) / "personalization.json").read_text(encoding="utf-8"))
-        assert len(stored["preferences"]) == 1
-        assert stored["preferences"][0]["preference"] == "改成更常问我怎么看。"
+        # Background-derived preferences share the source-version transaction in SQLite.
+        reopened = DialogManager(Client(), memory_path=Path(temp_dir) / "memory.json")
+        stored = reopened._load_personalization()
+        assert len(stored) == 1
+        assert stored[0]["preference"] == "改成更常问我怎么看。"
 
 
 def test_visual_novel_comment_receives_confirmed_user_preference():

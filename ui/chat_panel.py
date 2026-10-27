@@ -611,14 +611,15 @@ class ChatPanel(QWidget):
         if self._archive_future is not None:
             return
 
-        transcript = self.dialog_manager.pop_current_session_transcript()
+        snapshot = self.dialog_manager.pop_archive_snapshot()
+        transcript = snapshot["transcript"]
         if not transcript.strip():
             return
 
         if self.on_archive_state_change is not None:
             self.on_archive_state_change(True, "妹妹写日记中，请不要关闭")
 
-        self._archive_future = self._reply_executor.submit(self.dialog_manager.archive_transcript, transcript)
+        self._archive_future = self._reply_executor.submit(self.dialog_manager.archive_transcript, **snapshot)
         self.archive_poll_timer.start()
 
     def _poll_archive_task(self):

@@ -101,6 +101,7 @@ class LLMClient:
         model_name: Optional[str] = None,
         max_tokens: Optional[int] = None,
         timeout_sec: Optional[float] = None,
+        disable_thinking: bool = False,
     ) -> str:
         if self._client is None:
             return ""
@@ -118,10 +119,12 @@ class LLMClient:
             request_kwargs["max_tokens"] = max(1, int(max_tokens))
         if timeout_sec is not None:
             request_kwargs["timeout"] = max(0.5, float(timeout_sec))
+        if disable_thinking:
+            request_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
         response = self._client.chat.completions.create(**request_kwargs)
         return self._extract_response_text(response)
 
-    def describe_image(self, image: Image.Image, user_text: str, system_prompt: str) -> str:
+    def describe_image(self, image: Image.Image, user_text: str, system_prompt: str, *, disable_thinking: bool = False) -> str:
         if self._client is None:
             return ""
 
@@ -141,4 +144,5 @@ class LLMClient:
             model_name=self.settings.vision_model_name,
             max_tokens=self.settings.mm_output_max_tokens,
             timeout_sec=self.settings.mm_timeout_sec,
+            disable_thinking=disable_thinking,
         )

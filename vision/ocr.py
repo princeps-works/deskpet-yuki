@@ -19,6 +19,65 @@ _last_init_try_ts = 0.0
 _retry_interval_sec = 10.0
 
 
+# The game's bottom bar is read as one glued run -- "SAVELOADCONFIGSKIPAUTOLOG
+# Q.SAVEQ.LOAD" -- so the tokens are matched as a run first, which cannot damage
+# a real word, and only then as standalone words.
+_UI_CHROME_WORDS = (
+    "Q.SAVE",
+    "Q.LOAD",
+    "QUICKSAVE",
+    "QUICKLOAD",
+    "BACKLOG",
+    "CONFIG",
+    "SKIP",
+    "AUTO",
+    "SAVE",
+    "LOAD",
+    "LOG",
+    "MENU",
+    "HISTORY",
+    "TITLE",
+    "HIDE",
+)
+_UI_CHROME_TOKEN = "(?:" + "|".join(re.escape(word) for word in _UI_CHROME_WORDS) + ")"
+_UI_CHROME_RUN = re.compile(
+    rf"(?i){_UI_CHROME_TOKEN}(?:[\s._\-|]*{_UI_CHROME_TOKEN})+"
+)
+_UI_CHROME_ALONE = re.compile(
+    rf"(?i)(?<![A-Za-z0-9])(?:{_UI_CHROME_TOKEN})(?![A-Za-z0-9])"
+)
+
+
+def strip_ui_chrome(text: str) -> str:
+    """Remove the game's menu-bar words from OCR text.
+
+    The bottom bar sits inside the captured band, and OCR returns it glued to the
+    dialogue. ``prepare_ocr_text`` accepts that mixture as ``quality_ok``, so
+    without this the chrome is stored as if the player had read it out -- the
+    user's own cache contains the fact "台词中混有SAVE/LOAD/Q.SAVE/Q.LOAD等界面
+    文本". Stripping here keeps both the tracker and the panel on the real words.
+
+    ASCII-only tokens, so Chinese dialogue is untouched, and a lone token needs a
+    non-alphanumeric boundary (``DIALOGUE`` keeps its "LOG").
+    """
+    value = str(text or "")
+    if not value:
+        return ""
+    value = _UI_CHROME_RUN.sub(" ", value)
+    value = _UI_CHROME_ALONE.sub(" ", value)
+    value = re.sub(r"[ \t\u3000]{2,}", " ", value)
+    return value.strip(" \t\u3000")
+
+
+def normalize_speaker_name(text: str) -> str:
+    value = strip_ui_chrome(text).strip()
+    for left, right in [('【', '】'), ('[', ']')]:
+        if value.startswith(left) and value.endswith(right):
+            value = value[1:-1].strip()
+            break
+    return value if re.fullmatch(r"[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7afA-Za-z・·'-]{1,12}", value) else ''
+
+
 @dataclass(frozen=True)
 class OCRLine:
     text: str
@@ -131,6 +190,11 @@ def filter_visual_novel_ocr_result(
             for sample_y, sample_height, sample_left in samples
         )
 
+    # Locate dialogue before filtering: single-character labels need spatial evidence.
+    dialogue_lines = [line for line in result.lines if line.box is not None
+                      and len(line.text.strip()) >= 4 and line.box[2] - line.box[0] >= .08
+                      and any(c in line.text for c in '「」『』，。！？…')]
+
     for line in result.lines:
         compact = re.sub(r"\s+", "", str(line.text or ""))
         if not compact:
@@ -147,7 +211,18 @@ def filter_visual_novel_ocr_result(
         item_geometry = geometry(line)
         known_lane = in_dialogue_lane(item_geometry)
         sentence_like = cjk >= 6 or has_dialogue_punctuation
-        name_like = 2 <= cjk <= 6 and ascii_letters == 0 and confidence >= 0.78
+        single_name = normalize_speaker_name(line.text)
+        near_dialogue = (line.box is not None and line.box[2] - line.box[0] <= .22
+                         and line.box[3] - line.box[1] <= .24 and (
+                             known_lane or any(
+                                 (-.04 <= body.box[1] - line.box[3] <= .4
+                                  and abs(line.box[0] - body.box[0]) <= .16)
+                                 or (0 <= body.box[0] - line.box[2] <= .16
+                                     and abs((body.box[1] + body.box[3]
+                                              - line.box[1] - line.box[3]) / 2) <= .09)
+                                 for body in dialogue_lines if body is not line)))
+        name_like = (2 <= cjk <= 6 and ascii_letters == 0 and confidence >= .78
+                     or len(single_name) == 1 and cjk == 1 and confidence >= .40 and near_dialogue)
         clean_short_cjk = (
             cjk == len(compact)
             and not re.search(r"\S\s+\S", str(line.text or ""))

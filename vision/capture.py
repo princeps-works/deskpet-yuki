@@ -151,6 +151,7 @@ def capture_window_client(hwnd: int) -> Optional[Image.Image]:
     user32 = ctypes.windll.user32
     gdi32 = ctypes.windll.gdi32
     PW_RENDERFULLCONTENT = 0x00000002
+    PW_CLIENTONLY = 0x00000001
 
     class BITMAPINFOHEADER(ctypes.Structure):
         _fields_ = [
@@ -205,9 +206,9 @@ def capture_window_client(hwnd: int) -> Optional[Image.Image]:
 
     try:
         gdi32.SelectObject(memory_dc, bitmap)
-        ok = user32.PrintWindow(hwnd, memory_dc, PW_RENDERFULLCONTENT)
+        ok = user32.PrintWindow(hwnd, memory_dc, PW_RENDERFULLCONTENT | PW_CLIENTONLY)
         if not ok:
-            ok = user32.PrintWindow(hwnd, memory_dc, 0)
+            ok = user32.PrintWindow(hwnd, memory_dc, PW_CLIENTONLY)
         if not ok:
             return None
 

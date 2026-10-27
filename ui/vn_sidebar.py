@@ -18,6 +18,7 @@ from PyQt6.QtWidgets import (
 )
 
 from desktop_pet.config.settings import Settings
+from desktop_pet.llm.reaction_classifier import FILTER_MODELS, selected_filter_model
 
 
 class VnSidebar(QWidget):
@@ -29,6 +30,7 @@ class VnSidebar(QWidget):
     """
 
     capture_mode_changed = pyqtSignal(str)
+    filter_model_changed = pyqtSignal(str)
     vision_quota_changed = pyqtSignal(int)
     vision_change_threshold_changed = pyqtSignal(float)
     text_ratio_changed = pyqtSignal(float)
@@ -40,6 +42,8 @@ class VnSidebar(QWidget):
     select_ocr_region_requested = pyqtSignal()
     reset_ocr_region_requested = pyqtSignal()
     probe_ocr_requested = pyqtSignal()
+    confirm_speaker_layout_requested = pyqtSignal()
+    reset_speaker_layout_requested = pyqtSignal()
     select_story_requested = pyqtSignal()
     add_memory_requested = pyqtSignal(str)
     reload_memory_requested = pyqtSignal()
@@ -103,7 +107,8 @@ class VnSidebar(QWidget):
         self.scan_button = QPushButton("扫描设置", home)
         self.memory_button = QPushButton("记忆设置", home)
         self.story_button = QPushButton("剧情缓存", home)
-        for button in (self.scan_button, self.memory_button, self.story_button):
+        self.model_button = QPushButton("模型设置", home)
+        for button in (self.scan_button, self.memory_button, self.story_button, self.model_button):
             home_layout.addWidget(button)
         home.setStyleSheet(panel.styleSheet().replace("#vnPanel", "QWidget"))
         self.pages.addWidget(home)
@@ -115,6 +120,7 @@ class VnSidebar(QWidget):
         self.scan_button.clicked.connect(lambda: self._show_page(1))
         self.memory_button.clicked.connect(lambda: self._show_page(2))
         self.story_button.clicked.connect(self.select_story_requested.emit)
+        self.model_button.clicked.connect(lambda: self._show_page(3))
 
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(10, 10, 10, 10)
@@ -176,6 +182,21 @@ class VnSidebar(QWidget):
         ocr_row.addWidget(ocr_region_btn)
         ocr_row.addWidget(ocr_reset_btn)
         layout.addLayout(ocr_row)
+
+        self.speaker_status = QLabel("姓名栏：等待不同对白", panel)
+        self.speaker_status.setWordWrap(True)
+        layout.addWidget(self.speaker_status)
+        speaker_row = QHBoxLayout()
+        self.confirm_speaker_btn = QPushButton("确认姓名栏", panel)
+        self.confirm_speaker_btn.setToolTip("先查看带红框的候选截图，再确认并保存位置。")
+        self.confirm_speaker_btn.setEnabled(False)
+        self.confirm_speaker_btn.clicked.connect(self.confirm_speaker_layout_requested.emit)
+        self.reset_speaker_btn = QPushButton("重新学习", panel)
+        self.reset_speaker_btn.setEnabled(False)
+        self.reset_speaker_btn.clicked.connect(self.reset_speaker_layout_requested.emit)
+        speaker_row.addWidget(self.confirm_speaker_btn)
+        speaker_row.addWidget(self.reset_speaker_btn)
+        layout.addLayout(speaker_row)
 
         probe_btn = QPushButton("试读一次文本", panel)
         probe_btn.setToolTip("立刻按当前文本区识别一次，并把结果打印到控制台，方便确认框选对不对。")
@@ -319,13 +340,44 @@ class VnSidebar(QWidget):
         reset_story = QPushButton("清空记忆缓存", panel)
         reset_story.clicked.connect(self.reset_story_requested.emit)
         layout.addWidget(reset_story)
+
+        model_panel = QFrame(self)
+        model_panel.setObjectName("vnPanel")
+        model_panel.setStyleSheet(memory_panel.styleSheet())
+        self.pages.addWidget(model_panel)
+        model_layout = QVBoxLayout(model_panel)
+        model_layout.setContentsMargins(10, 10, 10, 10)
+        back = QPushButton("返回", model_panel)
+        back.clicked.connect(lambda: self._show_page(0))
+        model_layout.addWidget(back)
+        title = QLabel("评论筛选模型", model_panel)
+        title.setObjectName("vnTitle")
+        model_layout.addWidget(title)
+        self.filter_model = QComboBox(model_panel)
+        for model_id, label in FILTER_MODELS.items():
+            self.filter_model.addItem(label, model_id)
+        self.filter_model.setCurrentIndex(self.filter_model.findData(selected_filter_model(settings)))
+        self.filter_model.currentIndexChanged.connect(
+            lambda _: self.filter_model_changed.emit(str(self.filter_model.currentData())))
+        model_layout.addWidget(self.filter_model)
+        self.model_status = QLabel("等待初始化", model_panel)
+        self.model_status.setWordWrap(True)
+        model_layout.addWidget(self.model_status)
+        hint = QLabel("24条整理＋语义筛选：沿用原始触发方式。\n\n"
+                      "window-linear-v64：本地判断沉默、简短或完整评论。\n\n"
+                      "本轮最佳：BGE目标句编码＋GRU历史，判断发言或沉默。\n\n"
+                      "选择后立即切换并保存；三种方式均继续整理剧情记忆。", model_panel)
+        hint.setObjectName("vnHint")
+        hint.setWordWrap(True)
+        model_layout.addWidget(hint)
+        model_layout.addStretch()
         self._show_page(0)
 
     # -- slots --------------------------------------------------------------
 
     def _show_page(self, index: int) -> None:
         self.pages.setCurrentIndex(index)
-        height = 600 if index == 1 else (340 if index == 2 else 132)
+        height = {0: 172, 1: 600, 2: 340, 3: 390}.get(index, 172)
         screen = self.screen()
         if screen is not None:
             height = min(height, screen.availableGeometry().height() - 20)
@@ -367,8 +419,24 @@ class VnSidebar(QWidget):
     def set_target_status(self, text: str) -> None:
         self.target_status.setText(text or "-")
 
+    def set_speaker_layout(self, details: dict) -> None:
+        status = details.get('status', 'learning')
+        labels = {'learning': '等待不同对白，自动寻找位置',
+                  'candidate': '发现候选：' + ' / '.join(details.get('examples', [])),
+                  'confirmed': '已记住位置；' + (details.get('speaker') or '当前未确认说话人'),
+                  'layout_changed': '布局变化，已回退并重新学习'}
+        self.speaker_status.setText('姓名栏：' + labels.get(status, labels['learning']))
+        self.confirm_speaker_btn.setEnabled(status == 'candidate')
+        self.reset_speaker_btn.setEnabled(bool(details.get('key')))
+
     def set_memory_status(self, text: str) -> None:
         self.memory_status.setText(text or "-")
+
+    def set_filter_status(self, model_id: str, text: str) -> None:
+        self.filter_model.blockSignals(True)
+        self.filter_model.setCurrentIndex(self.filter_model.findData(model_id))
+        self.filter_model.blockSignals(False)
+        self.model_status.setText(text)
 
     def show_near(self, anchor_x: int, anchor_y: int, anchor_w: int, anchor_h: int) -> None:
         """Place the panel to the right of the pet window (or left if no room)."""

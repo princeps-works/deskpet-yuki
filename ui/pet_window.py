@@ -900,12 +900,20 @@ class DesktopPet(QWidget):
         self.bubble.move(x, y)
 
     def show_comment_bubble(self, text: str, duration_ms: int = 7000):
+        self._bubble_generation = getattr(self, "_bubble_generation", 0) + 1
         self.bubble.say(text)
         self.bubble.adjustSize()
         self._update_bubble_pos()
-        self._bubble_hide_timer.start(max(500, duration_ms))
+        self._bubble_hide_timer.stop()
+        if duration_ms > 0:
+            self._bubble_hide_timer.start(max(500, duration_ms))
+        else:
+            self.bubble.repaint()
+        return self._bubble_generation
 
-    def hide_comment_bubble(self):
+    def hide_comment_bubble(self, expected_generation=None):
+        if expected_generation is not None and expected_generation != getattr(self, "_bubble_generation", 0):
+            return
         self._bubble_hide_timer.stop()
         self.bubble.hide()
 

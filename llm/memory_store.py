@@ -41,6 +41,7 @@ class MemoryStore:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     parent_id INTEGER REFERENCES memory_items(id) ON DELETE CASCADE,
                     kind TEXT NOT NULL CHECK(kind IN ('diary', 'fact')),
+                    scope TEXT NOT NULL DEFAULT 'user',
                     slot TEXT NOT NULL DEFAULT 'diary',
                     summary TEXT NOT NULL,
                     subject TEXT NOT NULL DEFAULT '',
@@ -78,8 +79,49 @@ class MemoryStore:
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS memory_sources (
+                    id INTEGER PRIMARY KEY,
+                    transcript TEXT NOT NULL DEFAULT '',
+                    scope TEXT NOT NULL DEFAULT 'user',
+                    archive_key TEXT NOT NULL DEFAULT '',
+                    archive_revision INTEGER NOT NULL DEFAULT 0,
+                    preferences_json TEXT NOT NULL DEFAULT '[]'
+                );
+                CREATE TABLE IF NOT EXISTS memory_archive_jobs (
+                    key TEXT PRIMARY KEY,
+                    scope TEXT NOT NULL,
+                    transcript TEXT NOT NULL,
+                    revision INTEGER NOT NULL DEFAULT 1,
+                    cancelled INTEGER NOT NULL DEFAULT 0,
+                    committed_id INTEGER
+                );
+                CREATE TABLE IF NOT EXISTS memory_source_links (
+                    memory_id INTEGER NOT NULL REFERENCES memory_items(id) ON DELETE CASCADE,
+                    source_id INTEGER NOT NULL REFERENCES memory_sources(id) ON DELETE CASCADE,
+                    PRIMARY KEY(memory_id, source_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_memory_source ON memory_source_links(source_id);
+                INSERT OR IGNORE INTO memory_sources(id)
+                    SELECT id FROM memory_items WHERE kind='diary';
+                INSERT OR IGNORE INTO memory_source_links(memory_id, source_id)
+                    SELECT id, id FROM memory_items WHERE kind='diary';
+                INSERT OR IGNORE INTO memory_source_links(memory_id, source_id)
+                    SELECT id, parent_id FROM memory_items WHERE kind='fact' AND parent_id IS NOT NULL;
                 """
             )
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(memory_items)")}
+            if "scope" not in columns:
+                # Old summaries do not reliably identify a work. Preserve them as legacy.
+                connection.execute("ALTER TABLE memory_items ADD COLUMN scope TEXT NOT NULL DEFAULT 'legacy'")
+                connection.execute("UPDATE memory_items SET scope='user' WHERE slot='user_profile' OR source_type='manual'")
+            source_columns = {row[1] for row in connection.execute("PRAGMA table_info(memory_sources)")}
+            for name, definition in (("scope", "TEXT NOT NULL DEFAULT 'legacy'"),
+                                     ("archive_key", "TEXT NOT NULL DEFAULT ''"),
+                                     ("archive_revision", "INTEGER NOT NULL DEFAULT 0"),
+                                     ("preferences_json", "TEXT NOT NULL DEFAULT '[]'")):
+                if name not in source_columns:
+                    connection.execute(f"ALTER TABLE memory_sources ADD COLUMN {name} {definition}")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_memory_scope ON memory_items(scope, status, kind)")
             try:
                 connection.execute(
                     "CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts "
@@ -117,6 +159,7 @@ class MemoryStore:
     def _row_to_entry(cls, row: sqlite3.Row) -> dict[str, object]:
         return {
             "id": int(row["id"]),
+            "scope": str(row["scope"]),
             "schema_version": 3,
             "timestamp": str(row["created_at"]),
             "created_at": str(row["created_at"]),
@@ -165,7 +208,8 @@ class MemoryStore:
             if isinstance(raw, list):
                 for entry in raw[-self.diary_limit :]:
                     if isinstance(entry, dict) and self._clean(entry.get("summary")):
-                        self._insert_diary(connection, entry)
+                        self._insert_diary(connection, {**entry, "scope": entry.get("scope") or (
+                            "user" if entry.get("source_type") == "manual" else "legacy")})
             self._set_meta(connection, "legacy_json_migrated", self._now_iso())
 
     def _insert_fts(self, connection: sqlite3.Connection, item_id: int, summary: str, topics: Iterable[object]) -> None:
@@ -187,8 +231,8 @@ class MemoryStore:
             INSERT INTO memory_items(
                 kind, slot, summary, policy, pinned, importance, confidence,
                 freshness, source_type, sources_json, topics_json, created_at,
-                last_verified_at, expires_at
-            ) VALUES('diary', 'diary', ?, 'append', 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                last_verified_at, expires_at, scope
+            ) VALUES('diary', 'diary', ?, 'append', 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 summary,
@@ -201,9 +245,13 @@ class MemoryStore:
                 created_at,
                 self._clean(entry.get("last_verified_at"), 80),
                 self._clean(entry.get("expires_at"), 80),
+                str(entry.get("scope") or "user"),
             ),
         )
         item_id = int(cursor.lastrowid)
+        connection.execute("INSERT INTO memory_sources(id, scope) VALUES(?, ?)",
+                           (item_id, str(entry.get("scope") or "user")))
+        connection.execute("INSERT INTO memory_source_links VALUES(?, ?)", (item_id, item_id))
         self._insert_fts(connection, item_id, summary, topics)
         return item_id
 
@@ -220,16 +268,18 @@ class MemoryStore:
         allowed_slots = {"user_profile", "relationship", "current_state", "knowledge"}
         if slot not in allowed_slots:
             slot = "knowledge"
+        if slot == "user_profile" and subject.casefold() in {"user", "用户", "哥哥", "主人"}:
+            subject = "用户"
         pinned = bool(fact.get("pinned", False))
         policy = cls._clean(fact.get("policy"), 16).lower()
         if pinned:
             policy = "pinned"
         elif policy not in {"replace", "append"}:
             policy = "replace" if slot == "current_state" else "append"
-        freshness = cls._clean(fact.get("freshness") or diary.get("freshness") or "unknown", 16).lower()
+        freshness = cls._clean(fact.get("freshness") or "unknown", 16).lower()
         if freshness not in {"stable", "volatile", "unknown"}:
             freshness = "unknown"
-        expires_at = cls._clean(fact.get("expires_at") or diary.get("expires_at"), 80)
+        expires_at = cls._clean(fact.get("expires_at"), 80)
         if freshness == "volatile" and not expires_at:
             expires_at = (datetime.now().astimezone() + timedelta(days=7)).isoformat(timespec="seconds")
         return {
@@ -257,14 +307,17 @@ class MemoryStore:
         if normalized is None:
             return None
         now = self._now_iso()
+        scope = str(diary.get("scope") or "user")
+        cte, scope_params = self._recall_cte((scope,), now)
         duplicate = connection.execute(
-            """
-            SELECT id FROM memory_items
+            cte + """
+            SELECT id FROM recallable
             WHERE kind='fact' AND status='active' AND slot=? AND subject=?
               AND predicate=? AND object=? AND (expires_at='' OR expires_at>?)
             LIMIT 1
             """,
             (
+                *scope_params,
                 normalized["slot"],
                 normalized["subject"],
                 normalized["predicate"],
@@ -277,13 +330,13 @@ class MemoryStore:
 
         status = self._ACTIVE
         existing = connection.execute(
-            """
-            SELECT id, pinned FROM memory_items
+            cte + """
+            SELECT id, pinned FROM recallable
             WHERE kind='fact' AND status='active' AND slot=? AND subject=? AND predicate=?
               AND (expires_at='' OR expires_at>?)
             ORDER BY id DESC
             """,
-            (normalized["slot"], normalized["subject"], normalized["predicate"], now),
+            (*scope_params, normalized["slot"], normalized["subject"], normalized["predicate"], now),
         ).fetchall()
         if normalized["policy"] == "replace":
             if any(bool(row["pinned"]) for row in existing) and not normalized["pinned"]:
@@ -295,8 +348,8 @@ class MemoryStore:
                 parent_id, kind, slot, summary, subject, predicate, object,
                 policy, status, pinned, importance, confidence, freshness,
                 source_type, sources_json, topics_json, created_at,
-                last_verified_at, expires_at
-            ) VALUES(?, 'fact', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                last_verified_at, expires_at, scope
+            ) VALUES(?, 'fact', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 parent_id,
@@ -317,6 +370,7 @@ class MemoryStore:
                 self._clean(diary.get("created_at") or diary.get("timestamp"), 80) or self._now_iso(),
                 self._clean(diary.get("last_verified_at"), 80),
                 normalized["expires_at"],
+                scope,
             ),
         )
         item_id = int(cursor.lastrowid)
@@ -331,29 +385,91 @@ class MemoryStore:
                 )
         return item_id
 
-    def add_diary(self, entry: dict[str, object], facts: Iterable[object] = ()) -> int:
+    def prepare_archive(self, transcript: str, scope: str, *, source_key: str = "") -> dict:
+        """Persist the immutable input version before starting background inference."""
+        key = source_key or self._text_hash(scope + "\0" + transcript)
+        with self._write_lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT * FROM memory_archive_jobs WHERE key=?", (key,)).fetchone()
+            if row is None:
+                connection.execute("INSERT INTO memory_archive_jobs(key, scope, transcript) VALUES(?, ?, ?)",
+                                   (key, scope, transcript))
+            elif row["transcript"] != transcript or row["scope"] != scope:
+                connection.execute(
+                    "UPDATE memory_archive_jobs SET scope=?, transcript=?, revision=revision+1, "
+                    "committed_id=NULL, cancelled=0 WHERE key=?", (scope, transcript, key))
+            return dict(connection.execute("SELECT * FROM memory_archive_jobs WHERE key=?", (key,)).fetchone())
+
+    def invalidate_archive(self, source_key: str) -> None:
+        with self._write_lock, self._connect() as connection:
+            connection.execute("UPDATE memory_archive_jobs SET revision=revision+1, cancelled=1, "
+                               "committed_id=NULL WHERE key=?", (source_key,))
+
+    def archive_is_current(self, source_key: str, revision: int = 1) -> bool:
+        with self._connect() as connection:
+            row = connection.execute("SELECT revision, cancelled FROM memory_archive_jobs WHERE key=?", (source_key,)).fetchone()
+            # A live session has a source key before its first archive is prepared.
+            return row is None or (row["revision"] == revision and not row["cancelled"])
+
+    def add_diary(
+        self, entry: dict[str, object], facts: Iterable[object] = (), *, source_transcript: str = "",
+        archive: dict | None = None,
+    ) -> int | None:
         with self._write_lock:
             with self._connect() as connection:
+                # The version check and every derived write share one SQLite write transaction.
+                connection.execute("BEGIN IMMEDIATE")
+                if archive is not None:
+                    job = connection.execute("SELECT * FROM memory_archive_jobs WHERE key=?", (archive["key"],)).fetchone()
+                    if (job is None or job["cancelled"] or job["revision"] != archive["revision"]
+                            or job["transcript"] != source_transcript
+                            or job["scope"] != str(entry.get("scope") or "user")):
+                        return None
+                    if job["committed_id"] is not None:
+                        return int(job["committed_id"])
                 parent_id = self._insert_diary(connection, entry)
+                connection.execute(
+                    "UPDATE memory_sources SET transcript=?, archive_key=?, archive_revision=?, preferences_json=? WHERE id=?",
+                    (source_transcript, archive["key"] if archive else "", archive["revision"] if archive else 0,
+                     json.dumps(entry.get("personalization") or [], ensure_ascii=False), parent_id)
+                )
                 for fact in list(facts)[:12]:
-                    self._insert_fact(connection, parent_id, fact, entry)
+                    fact_id = self._insert_fact(connection, parent_id, fact, entry)
+                    if fact_id is not None:
+                        # A deduplicated fact can also invalidate this newer summary later.
+                        connection.execute(
+                            "INSERT OR IGNORE INTO memory_source_links VALUES(?, ?)", (fact_id, parent_id)
+                        )
                 self._trim(connection)
+                if archive is not None:
+                    connection.execute("UPDATE memory_archive_jobs SET committed_id=? WHERE key=?",
+                                       (parent_id, archive["key"]))
             self._write_legacy_mirror()
             return parent_id
 
     def _trim(self, connection: sqlite3.Connection) -> None:
         rows = connection.execute(
-            "SELECT id FROM memory_items WHERE kind='diary' ORDER BY id DESC LIMIT -1 OFFSET ?",
+            "SELECT id FROM memory_items WHERE kind='diary' AND source_type!='screen_plot' ORDER BY id DESC LIMIT -1 OFFSET ?",
             (self.diary_limit,),
         ).fetchall()
         if rows:
+            # Keep fact lifecycles and their sources even when the diary UI rolls over.
+            connection.executemany(
+                "UPDATE memory_items SET parent_id=NULL WHERE parent_id=? AND kind='fact'",
+                [(int(row[0]),) for row in rows],
+            )
             connection.executemany("DELETE FROM memory_items WHERE id = ?", [(int(row[0]),) for row in rows])
+            connection.execute(
+                "DELETE FROM memory_sources WHERE preferences_json='[]' "
+                "AND id NOT IN (SELECT source_id FROM memory_source_links)"
+            )
 
     def list_diaries(self, limit: int = 0) -> list[dict[str, object]]:
-        query = "SELECT * FROM memory_items WHERE kind='diary' ORDER BY id"
+        # Legacy plot mirrors stay in SQLite, but are not interaction diaries.
+        query = "SELECT * FROM memory_items WHERE kind='diary' AND source_type!='screen_plot' ORDER BY id"
         params: tuple[object, ...] = ()
         if limit > 0:
-            query = "SELECT * FROM (SELECT * FROM memory_items WHERE kind='diary' ORDER BY id DESC LIMIT ?) ORDER BY id"
+            query = "SELECT * FROM (SELECT * FROM memory_items WHERE kind='diary' AND source_type!='screen_plot' ORDER BY id DESC LIMIT ?) ORDER BY id"
             params = (int(limit),)
         with self._connect() as connection:
             return [self._row_to_entry(row) for row in connection.execute(query, params).fetchall()]
@@ -362,7 +478,7 @@ class MemoryStore:
         entries = self.list_diaries()
         payload = [
             {key: value for key, value in entry.items() if key in {
-                "schema_version", "timestamp", "created_at", "last_verified_at", "summary",
+                "schema_version", "timestamp", "created_at", "last_verified_at", "summary", "scope",
                 "source_type", "sources", "confidence", "freshness", "expires_at", "topics",
             }}
             for entry in entries
@@ -383,17 +499,86 @@ class MemoryStore:
                 terms.extend(segment[index : index + 2] for index in range(len(segment) - 1))
         return list(dict.fromkeys(term for term in terms if term))[:16]
 
-    def candidates(self, query: str, *, limit: int = 80) -> list[dict[str, object]]:
+    @staticmethod
+    def _recall_cte(scopes: Iterable[str], now: str) -> tuple[str, tuple]:
+        scopes = tuple(dict.fromkeys(scopes))
+        placeholders = ",".join("?" for _ in scopes) or "NULL"
+        # Scope and lifecycle checks precede candidate LIMIT, FTS ranking and embeddings.
+        return """
+            WITH current_sources AS (
+                SELECT s.* FROM memory_sources s LEFT JOIN memory_archive_jobs j ON j.key=s.archive_key
+                WHERE s.archive_key='' OR (j.revision=s.archive_revision AND j.cancelled=0)
+            ), valid AS (
+                SELECT m.* FROM memory_items m WHERE m.status='active'
+                AND (m.expires_at='' OR m.expires_at>?)
+                AND (NOT EXISTS (SELECT 1 FROM memory_source_links l WHERE l.memory_id=m.id)
+                     OR EXISTS (SELECT 1 FROM memory_source_links l JOIN current_sources s ON s.id=l.source_id
+                                WHERE l.memory_id=m.id))
+            ), blocked_sources AS (
+                SELECT DISTINCT l.source_id FROM memory_source_links l JOIN memory_items f ON f.id=l.memory_id
+                WHERE f.kind='fact' AND f.id NOT IN (SELECT id FROM valid)
+            ), recallable AS (
+                SELECT m.* FROM valid m WHERE m.scope IN (""" + placeholders + """)
+                AND (m.kind!='diary' OR NOT EXISTS (
+                    SELECT 1 FROM memory_source_links l JOIN blocked_sources b ON b.source_id=l.source_id
+                    WHERE l.memory_id=m.id))
+            )
+        """, (now, *scopes)
+
+    def personalizations(self, *, scopes: Iterable[str] = ("user",)) -> list[dict]:
+        scopes = tuple(dict.fromkeys(scopes))
+        if not scopes:
+            return []
+        cte, params = self._recall_cte(scopes, self._now_iso())
+        with self._connect() as connection:
+            rows = connection.execute(cte + "SELECT scope, preferences_json FROM current_sources ORDER BY id", params)
+            return [item for row in rows for item in self._loads_list(row["preferences_json"])
+                    if isinstance(item, dict) and item.get("scope", row["scope"]) in scopes]
+
+    def read_evidence(self, memory_id: int, *, scopes: Iterable[str] = ("user",)) -> dict[str, object]:
+        """Read retained source text without reviving superseded or expired facts."""
         now = self._now_iso()
+        scopes = tuple(scopes)
+        cte, params = self._recall_cte(scopes, now)
+        with self._connect() as connection:
+            row = connection.execute(
+                cte + "SELECT * FROM recallable WHERE id=? AND source_type!='screen_plot'",
+                (*params, memory_id),
+            ).fetchone()
+            if row is None:
+                # Do not disclose out-of-scope IDs, even through error status.
+                limited = connection.execute(cte + "SELECT id FROM valid WHERE id=? AND kind='diary' AND scope IN ("
+                                             + (",".join("?" for _ in scopes) or "NULL") + ")",
+                                             (*params, memory_id, *scopes)).fetchone()
+                if limited:
+                    return {"status": "lifecycle_limited", "sources": []}
+                return {"status": "not_found", "sources": []}
+            entry = self._row_to_entry(row)
+            sources = connection.execute(
+                cte + "SELECT s.id, s.transcript, s.archive_revision, "
+                "s.id IN (SELECT source_id FROM blocked_sources) AS restricted FROM current_sources s "
+                "JOIN memory_source_links l ON l.source_id=s.id WHERE l.memory_id=? AND s.scope IN ("
+                + (",".join("?" for _ in scopes) or "NULL") + ") ORDER BY s.id",
+                (*params, memory_id, *scopes),
+            ).fetchall()
+            visible = [{"source_id": int(source["id"]), "revision": source["archive_revision"], "transcript": source["transcript"]}
+                       for source in sources if not source["restricted"] and source["transcript"]]
+            return {"status": "success", "memory": entry, "sources": visible,
+                    "source_status": "ok" if visible else (
+                        "lifecycle_limited" if any(s["restricted"] for s in sources) else "unavailable")}
+
+    def candidates(self, query: str, *, limit: int | None = 80,
+                   scopes: Iterable[str] = ("user",)) -> list[dict[str, object]]:
+        now = self._now_iso()
+        cte, params = self._recall_cte(scopes, now)
         with self._connect() as connection:
             rows = connection.execute(
-                """
-                SELECT * FROM memory_items
-                WHERE status='active' AND (expires_at='' OR expires_at>?)
+                cte + """
+                SELECT * FROM recallable WHERE source_type!='screen_plot'
                 ORDER BY pinned DESC, id DESC
                 LIMIT ?
                 """,
-                (now, max(20, int(limit))),
+                (*params, -1 if limit is None else max(20, int(limit))),
             ).fetchall()
             by_id = {int(row["id"]): self._row_to_entry(row) for row in rows}
             terms = self._fts_terms(query)
@@ -404,9 +589,8 @@ class MemoryStore:
                 for term in like_terms:
                     like_params.extend((f"%{term}%", f"%{term}%"))
                 for row in connection.execute(
-                    "SELECT * FROM memory_items WHERE status='active' "
-                    "AND (expires_at='' OR expires_at>?) AND (" + where + ") LIMIT 60",
-                    (now, *like_params),
+                    cte + "SELECT * FROM recallable WHERE source_type!='screen_plot' AND (" + where + ") LIMIT 60",
+                    (*params, *like_params),
                 ).fetchall():
                     entry = self._row_to_entry(row)
                     entry["fts_score"] = max(float(entry.get("fts_score") or 0.0), 0.65)
@@ -414,22 +598,17 @@ class MemoryStore:
                 try:
                     match = " OR ".join(f'"{term.replace(chr(34), chr(34) * 2)}"' for term in terms)
                     fts_rows = connection.execute(
-                        "SELECT rowid FROM memory_fts WHERE memory_fts MATCH ? ORDER BY bm25(memory_fts) LIMIT 40",
-                        (match,),
+                        cte + "SELECT m.* FROM memory_fts JOIN recallable m ON m.id=memory_fts.rowid "
+                        "WHERE memory_fts MATCH ? AND m.source_type!='screen_plot' ORDER BY bm25(memory_fts) LIMIT 40",
+                        (*params, match),
                     ).fetchall()
                     for rank, fts_row in enumerate(fts_rows):
-                        item_id = int(fts_row[0])
-                        row = connection.execute(
-                            "SELECT * FROM memory_items WHERE id=? AND status='active' AND (expires_at='' OR expires_at>?)",
-                            (item_id, now),
-                        ).fetchone()
-                        if row:
-                            entry = self._row_to_entry(row)
-                            entry["fts_score"] = max(0.2, 1.0 - rank / max(1, len(fts_rows)))
-                            by_id[item_id] = entry
+                        entry = self._row_to_entry(fts_row)
+                        entry["fts_score"] = max(0.2, 1.0 - rank / max(1, len(fts_rows)))
+                        by_id[entry["id"]] = entry
                 except sqlite3.OperationalError:
                     pass
-        return list(by_id.values())
+            return list(by_id.values())
 
     def mark_recalled(self, item_ids: Iterable[int]) -> None:
         ids = list(dict.fromkeys(int(value) for value in item_ids if int(value) > 0))

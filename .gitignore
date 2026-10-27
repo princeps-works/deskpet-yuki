@@ -8,6 +8,8 @@ __pycache__/
 assets/models/m2m100_418M_ct2/
 assets/models/index_translate_2b/
 tools/llama_cpp/
+tools/gpt_sovits/
+VOICE_model/
 assets/models/bge-small-zh-v1.5-onnx/
 stanza_resources/
 
@@ -31,3 +33,5 @@ data/_*.py
 scripts/_*.py
 
 皮套/**/runtime/live2d_runtime_*.model3.json
+assets/models/vn-reaction-v64/
+assets/models/vn-reaction-fusion-r8/

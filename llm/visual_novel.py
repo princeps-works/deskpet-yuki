@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import copy
 import hashlib
 import re
 import shutil
@@ -12,6 +13,8 @@ from datetime import datetime
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Callable
+
+from desktop_pet.llm.history_archive import HistoryArchive
 
 
 @dataclass(frozen=True)
@@ -318,10 +321,28 @@ class VisualNovelTracker:
         self._dedup_ngram_guard = max(0.05, min(1.0, float(dedup_ngram_guard)))
         self._dedup_semantic_merge = max(0.5, min(1.0, float(dedup_semantic_merge)))
         self._calibrator = calibrator
+        self._local_reaction_enabled = False
         self._reset_story_state()
         self._load()
+        self._open_archive()
+
+    def _open_archive(self):
+        self._archive = HistoryArchive(self.path.with_suffix('.history.sqlite3'))
+        for item in self._lines:
+            self._archive.add('原始台词', str(item.get('text', '')), item)
+        for kind, values in [('场景', self._scene_log), ('关键事实', self._facts)]:
+            for text in values:
+                self._archive.add(kind, text, {'source': 'legacy_cache', 'branch': 'unknown'})
+        for item in self._characters.values():
+            for field in ('role', 'appearance', 'known_so_far'):
+                values = item.get(field, [])
+                for text in ([values] if isinstance(values, str) else values):
+                    self._archive.add('历史人物资料', f"{item.get('name', '')}: {text}",
+                                      {'character_id': item.get('id'), 'source': 'legacy_cache', 'branch': 'unknown'})
 
     def _reset_story_state(self) -> None:
+        self._branch_id = f'unknown-{time.time_ns()}'
+        self._character_redirects = {}
         self._lines: list[dict] = []
         self._scene_summary = ""
         self._scene_log: list[str] = []
@@ -330,6 +351,7 @@ class VisualNovelTracker:
         self._viewer_notes: list[str] = []
         self._game_title = ""
         self._recent_comments: list[str] = []
+        self._local_comment_turns: list[dict] = []
         self._total_lines = 0
         self._summarized_line_count = 0
         self._last_requested_line_count = 0
@@ -345,11 +367,13 @@ class VisualNovelTracker:
         if next_path == self.path:
             self._reset_story_state()
             self._load()
+            self._open_archive()
             return
         self.flush()
         self.path = next_path
         self._reset_story_state()
         self._load()
+        self._open_archive()
 
     @staticmethod
     def _normalize(text: str) -> str:
@@ -405,14 +429,17 @@ class VisualNovelTracker:
         value = re.sub(r"\s+", "", str(text or ""))
         if not value:
             return True
-        if cls._REPEATED_PUNCTUATION.search(value) or cls._MIXED_CODE_TOKEN.fullmatch(value):
+        has_dialogue_text = bool(re.search(r'[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]', value))
+        if (cls._MIXED_CODE_TOKEN.fullmatch(value)
+                or (cls._REPEATED_PUNCTUATION.search(value)
+                    and not has_dialogue_text and not cls._looks_sentence_like(value))):
             return True
         meaningful = sum(
             char.isalnum() or "\u3400" <= char <= "\u9fff" or "\u3040" <= char <= "\u30ff"
             for char in value
         )
         punctuation = sum(not char.isalnum() and not char.isspace() for char in value)
-        return len(value) >= 4 and meaningful <= 1 and punctuation / len(value) >= 0.5
+        return not has_dialogue_text and len(value) >= 4 and meaningful <= 1 and punctuation / len(value) >= 0.5
 
     @staticmethod
     def _looks_sentence_like(text: str) -> bool:
@@ -496,11 +523,34 @@ class VisualNovelTracker:
         cutoff made the recall path silently useless whenever the player phrased
         a question slightly differently from the stored text.
         """
-        normalized_query = self._normalize(query)
+        primary_query, _, recent_context = str(query).partition('\n最近对话中的指代线索（仅供检索）：\n')
+        normalized_query = self._normalize(primary_query)
         if not normalized_query:
             return ""
 
         candidates: list[tuple[str, str]] = []
+        archive_rows = self._archive.rows()
+        revised = {row['payload'].get('existing') for row in archive_rows if row['kind'] == '事实修正'}
+        for row in archive_rows:
+            old_id = row['payload'].get('character_id')
+            card = self._characters.get(self._character_redirects.get(old_id, old_id))
+            if card and row['kind'] == '历史人物资料':
+                row['text'] = f"{card.get('name', '')}（{card.get('identity_summary') or card.get('role', '')}）: {row['text']}"
+        # A name and its identifying description often occupy adjacent OCR
+        # lines. Retrieve that evidence together instead of isolated mentions.
+        numbered = {int(row['payload']['id']): (row['text'], row['payload'].get('branch')) for row in archive_rows
+                    if row['kind'] == '原始台词' and str(row['payload'].get('id', '')).isdigit()
+                    and not self._is_runtime_noise(row['text'])}
+        for row in archive_rows:
+            line_id = row['payload'].get('id')
+            if row['kind'] == '原始台词' and str(line_id).isdigit():
+                line_id = int(line_id)
+                branch = row['payload'].get('branch')
+                row['text'] = ' / '.join(numbered[i][0] for i in range(line_id - 2, line_id + 3)
+                                         if i in numbered and numbered[i][1] == branch)
+        candidates.extend((row['kind'], row['text']) for row in archive_rows
+                          if row['kind'] in {'原始台词', '场景', '关键事实', '历史人物资料', '待核对人物信息', '身份揭示'}
+                          and row['text'] not in revised)
         if self._scene_summary and not self._is_runtime_noise(self._scene_summary):
             candidates.append(("剧情摘要", self._scene_summary))
         candidates.extend(
@@ -526,7 +576,15 @@ class VisualNovelTracker:
 
         deduped: list[tuple[str, str]] = []
         seen: set[str] = set()
+        disputed = [(row['payload'].get('character', ''), row['text']) for row in archive_rows if row['kind'] == '人物归属争议']
+        candidates = [(kind, text[start:start + 600]) for kind, text in candidates
+                      if text and not self._is_runtime_noise(text)
+                      for start in range(0, len(text), 600)]
         for kind, text in candidates:
+            if not text or self._is_runtime_noise(text):
+                continue
+            if any(name and name in text and fragment in text for name, fragment in disputed):
+                kind = '待核对人物归属（不可当作身份依据）'
             if text in seen:
                 continue
             seen.add(text)
@@ -534,10 +592,19 @@ class VisualNovelTracker:
         if not deduped:
             return ""
 
-        candidate_scores = self._similarities(normalized_query, [text for _, text in deduped])
+        candidate_scores = self._archive.similarities(normalized_query, [text for _, text in deduped], self._similarities_fn)
+        if candidate_scores is None:
+            candidate_scores = self._similarities(normalized_query, [text for _, text in deduped])
         intent_scores = self._similarities(normalized_query, list(self._RECALL_ANCHORS))
         if candidate_scores is None or intent_scores is None:
-            return self._fallback_excerpt(max_chars=max_chars, query=normalized_query)
+            tokens = set(re.findall(r'[\u4e00-\u9fff]{2}|[a-zA-Z]{2,}', normalized_query))
+            matches = [(kind, text) for kind, text in deduped if any(t in text for t in tokens)]
+            matches = [(kind, text) for kind, text in matches if not kind.startswith('待核对')]
+            if matches:
+                return self._chat_excerpt('\n'.join(f'{kind}: {text}' for kind, text in matches[:limit]), max_chars=max_chars)
+            if self.story_title and self.story_title in normalized_query:
+                return self._fallback_excerpt(max_chars=max_chars, query=normalized_query)
+            return ""
 
         intent_score = max(intent_scores, default=0.0)
         story_title = self.story_title.strip()
@@ -555,26 +622,34 @@ class VisualNovelTracker:
             return self._fallback_excerpt(max_chars=max_chars, query=normalized_query)
 
         minimum_score = 0.34 if intent_score >= 0.52 else 0.52
+        named = [str(item.get('name', '')) for item in self._characters.values()
+                 if item.get('name') and any(value and value in normalized_query
+                    for value in [item['name'], *item.get('aliases', []), *item.get('ocr_names', [])])]
+        context_scores = self._archive.similarities(
+            self._normalize(recent_context), [text for _, text in deduped], self._similarities_fn
+        ) if recent_context else None
+        if context_scores is None:
+            context_scores = [0.0] * len(deduped)
         ranked = sorted(
             (
-                (score, index, kind, text)
+                (score - (0.18 if kind.startswith('待核对') else 0.0)
+                 + (0.16 if any(name in text for name in named) else 0.0)
+                 + 0.12 * context_scores[index], index, kind, text)
                 for index, ((kind, text), score) in enumerate(zip(deduped, candidate_scores))
-                if score >= minimum_score
+                if score >= minimum_score and not kind.startswith('待核对')
             ),
             key=lambda item: (-item[0], item[1]),
         )
-        if intent_score >= 0.52 and self._scene_summary:
-            summary_row = next((row for row in ranked if row[2] == "剧情摘要"), None)
-            if summary_row is None:
-                summary_index = next((i for i, row in enumerate(deduped) if row[0] == "剧情摘要"), -1)
-                if summary_index >= 0:
-                    ranked.insert(0, (candidate_scores[summary_index], summary_index, *deduped[summary_index]))
-
         if not ranked:
             return self._fallback_excerpt(max_chars=max_chars, query=normalized_query)
 
         output: list[str] = []
         used = 0
+        for item in self._characters.values():
+            if item.get('name') in named:
+                line = f"人物身份记录（历史整理，须与原文核对）: {item['name']}；{item.get('identity_summary') or item.get('role', '')}；别名：{'、'.join(item.get('aliases', []))}"
+                output.append(line)
+                used += len(line) + 1
         for _, _, kind, text in ranked[: max(1, int(limit))]:
             line = f"{kind}: {text}"
             remaining = max(0, int(max_chars) - used)
@@ -582,7 +657,14 @@ class VisualNovelTracker:
                 break
             output.append(line[:remaining])
             used += len(output[-1]) + 1
-        return "\n".join(output).strip()
+        self.last_retrieval = {'query': normalized_query, 'candidate_count': len(deduped), 'selected': output}
+        return self._chat_excerpt("\n".join(output).strip(), max_chars=max_chars)
+
+    def _chat_excerpt(self, content: str, *, max_chars: int) -> str:
+        if not content or max_chars <= 0:
+            return ""
+        header = f"当前作品: 《{self.story_title}》\n"
+        return (header + content[:max(0, max_chars - len(header))])[:max_chars]
 
     def _fallback_excerpt(self, *, max_chars: int, query: str = "") -> str:
         """Low-confidence excerpt:主线摘要 plus the newest facts only."""
@@ -605,7 +687,7 @@ class VisualNovelTracker:
             budget = max(0, int(max_chars) - sum(len(part) + 1 for part in parts))
             if budget > 0:
                 parts.append("关键事实: " + "；".join(clean_facts)[:budget])
-        return "\n".join(parts).strip()[: max(0, int(max_chars))]
+        return self._chat_excerpt("\n".join(parts).strip(), max_chars=max(0, int(max_chars)))
 
     def build_planner_hint(self, *, max_chars: int = 600) -> str:
         """Expose only compressed story memory for search-query disambiguation."""
@@ -641,6 +723,7 @@ class VisualNovelTracker:
                 -self._max_facts :
             ]
         raw_characters = data.get("characters", {})
+        self._character_redirects = dict(data.get('character_redirects', {}))
         if isinstance(raw_characters, dict):
             self._characters = {
                 str(character_id): item
@@ -675,6 +758,7 @@ class VisualNovelTracker:
             "scene_log": self._scene_log[-self._scene_log_limit :],
             "facts": self._facts[-self._max_facts :],
             "characters": self._characters,
+            "character_redirects": self._character_redirects,
             "viewer_notes": self._viewer_notes[:6],
             "game_title": self._game_title,
             "recent_comments": self._recent_comments[-self._recent_comment_limit :]
@@ -691,14 +775,10 @@ class VisualNovelTracker:
     # -- fact de-duplication ------------------------------------------------
 
     def _fact_verdict(self, candidate: str) -> DedupVerdict:
-        """Decide whether a candidate fact duplicates one already stored.
+        """Only identical facts are duplicates; similarity identifies candidates.
 
-        Two independent evidence sources are combined, because a pure embedding
-        threshold is unreliable on Chinese short text: BGE-style models put
-        unrelated sentences well above zero, so a naive cut merges facts that
-        merely share a topic. Character n-gram overlap is exact and catches the
-        common case (same fact, different phrasing), while the cosine score
-        breaks ties.
+        Similar wording can express a negation or a changed state. Keep those
+        facts unless the regular evaluation explicitly supplies fact_updates.
         """
         if not self._facts:
             return DedupVerdict(False, -1, 0.0, None, 0.0, 0.0, "no_existing")
@@ -738,13 +818,10 @@ class VisualNovelTracker:
 
         chosen = lexical_best
         rule = "kept"
-        duplicate = False
         if float(lexical_best["ngram"]) >= self._dedup_ngram_merge:
-            duplicate = True
-            rule = "ngram"
+            rule = "ngram_candidate"
         elif float(lexical_best["char_ratio"]) >= 0.88:
-            duplicate = True
-            rule = "char_fallback"
+            rule = "char_candidate"
         elif scores is not None:
             for item in semantic_ranked[:3]:
                 cosine = float(item["cosine"])
@@ -754,9 +831,13 @@ class VisualNovelTracker:
                 )
                 if cosine >= self._dedup_semantic_merge and lexical_support:
                     chosen = item
-                    duplicate = True
-                    rule = "semantic+lexical"
+                    rule = "semantic+lexical_candidate"
                     break
+
+        duplicate = candidate in self._facts
+        if duplicate:
+            chosen = metrics[self._facts.index(candidate)]
+            rule = "exact"
 
         top_matches = tuple(
             {
@@ -780,7 +861,7 @@ class VisualNovelTracker:
             top_matches=top_matches,
         )
 
-    def _merge_facts(self, incoming: list[str], *, keep_longest: bool = True) -> tuple[list[str], int]:
+    def _merge_facts(self, incoming: list[str]) -> tuple[list[str], int]:
         """Merge new facts into the store, returning (added, duplicate_count)."""
         added: list[str] = []
         duplicates = 0
@@ -806,9 +887,6 @@ class VisualNovelTracker:
                 )
             if verdict.duplicate and verdict.index >= 0:
                 duplicates += 1
-                existing = self._facts[verdict.index]
-                if keep_longest and len(fact) > len(existing):
-                    self._facts[verdict.index] = fact
                 continue
             if fact not in self._facts:
                 self._facts.append(fact)
@@ -826,7 +904,7 @@ class VisualNovelTracker:
         max_chars: int = 760,
         recent_count: int = 4,
     ) -> list[str]:
-        """Select relevant facts while always retaining a small recent tail."""
+        """Select related facts, reserving at most one third for the recent tail."""
         if not self._facts:
             return []
         limit = max(1, int(limit))
@@ -837,7 +915,7 @@ class VisualNovelTracker:
         used = 0
         for index in recent_indexes:
             cost = len(self._facts[index]) + (1 if selected else 0)
-            if selected and used + cost > max_chars:
+            if used + cost > max_chars // 3:
                 continue
             selected.add(index)
             used += cost
@@ -846,9 +924,13 @@ class VisualNovelTracker:
         if scores is not None:
             ranked = sorted(range(len(self._facts)), key=lambda index: scores[index], reverse=True)
         else:
-            ranked = list(range(len(self._facts) - 1, -1, -1))
+            ranked = sorted(range(len(self._facts)),
+                            key=lambda index: (_ngram_containment(query, self._facts[index]), index),
+                            reverse=True)
 
         for index in ranked:
+            if len(selected) >= limit:
+                break
             if index in selected:
                 continue
             cost = len(self._facts[index]) + (1 if selected else 0)
@@ -873,15 +955,20 @@ class VisualNovelTracker:
         if not label:
             return ""
         parts = [label]
-        role = str(item.get("role", "")).strip()
+        role = str(item.get('identity_summary') or item.get("role", "")).strip()
         if role:
             parts.append(role)
         appearance = [str(value).strip() for value in item.get("appearance", []) if str(value).strip()]
         known = [str(value).strip() for value in item.get("known_so_far", []) if str(value).strip()]
         if appearance:
             parts.append("、".join(appearance[-2:]))
+        for form in item.get('forms', []):
+            if form.get('appearance'):
+                parts.append(f"{form.get('entity_type', 'unknown')}形态：" + '、'.join(form['appearance'][-2:]))
         if known:
             parts.append("；".join(known[-3:]))
+        if any(claim.get('status') == 'conflict' for claim in item.get('claims', [])):
+            parts.append('存在身份或属性冲突，须核对原始证据，不可把冲突记录当确定事实')
         return "：".join(parts)
 
     def _select_characters_for_context(
@@ -889,43 +976,59 @@ class VisualNovelTracker:
         query: str,
         *,
         limit: int = 5,
-        max_chars: int = 420,
+        max_chars: int = 900,
+        visual_context: str = '',
     ) -> list[dict]:
         if not self._characters:
             return []
         records = list(self._characters.items())
         descriptions = [self._character_text(item) for _, item in records]
         semantic = self._similarities(self._normalize(query), descriptions)
+        visual_scores = self._similarities(self._normalize(visual_context), descriptions) if visual_context else None
         normalized_query = self._normalize(query).casefold()
 
         ranked: list[tuple[float, int, str, dict]] = []
         for index, (character_id, item) in enumerate(records):
             names = [str(item.get("name", "")).strip()]
             names.extend(str(value).strip() for value in item.get("aliases", []) if str(value).strip())
+            names.extend(str(value).strip() for value in item.get("ocr_names", []) if str(value).strip())
             mentioned = any(value.casefold() in normalized_query for value in names if value)
             score = semantic[index] if semantic is not None else 0.0
             last_seen = int(item.get("last_seen_line", 0) or 0)
-            ranked.append((score + (1.0 if mentioned else 0.0), last_seen, character_id, item))
+            visual_score = visual_scores[index] if visual_scores is not None else 0.0
+            ranked.append((max(score, visual_score) + (0.35 if mentioned else 0.0), last_seen, character_id, item))
         ranked.sort(key=lambda row: (row[0], row[1]), reverse=True)
 
         output: list[dict] = []
         used = 0
-        for _, _, character_id, item in ranked[: max(1, int(limit))]:
+        selected = ranked[:max(1, int(limit))]
+        # Keep homonymous identities together so the model can compare them.
+        selected_names = {row[3].get('name') for row in selected if row[3].get('name')}
+        ambiguous_names = {name for name in selected_names if name.casefold() in normalized_query
+                           and sum(item.get('name') == name for _, item in records) > 1}
+        grouped = [row for row in ranked if row[3].get('name') in ambiguous_names]
+        selected = (grouped + [row for row in selected if row[3].get('name') not in ambiguous_names])[:max(1, int(limit))]
+        per_card = max_chars // max(1, len(selected))
+        for _, _, character_id, item in selected:
             compact = {
                 "id": character_id,
                 "name": str(item.get("name", "")).strip(),
-                "aliases": list(item.get("aliases", []))[-3:],
-                "role": str(item.get("role", "")).strip(),
-                "appearance": list(item.get("appearance", []))[-2:],
-                "known_so_far": list(item.get("known_so_far", []))[-4:],
-                "status": str(item.get("status", "provisional")),
-                "confidence": item.get("confidence", 0.0),
+                "entity_type": item.get('entity_type', 'unknown'),
+                "role": str(item.get('identity_summary') or item.get("role", "")).strip()[:100],
+                "appearance": list(item.get("appearance", []))[-1:],
+                "known_so_far": list(item.get("known_so_far", []))[-2:],
             }
+            variants = list(item.get('ocr_names', []))[-2:]
+            if variants:
+                compact['ocr_names'] = variants
             encoded = json.dumps(compact, ensure_ascii=False)
-            while len(encoded) > max_chars - used and compact["known_so_far"]:
+            while len(encoded) > per_card and compact["known_so_far"]:
                 compact["known_so_far"].pop(0)
                 encoded = json.dumps(compact, ensure_ascii=False)
-            while len(encoded) > max_chars - used and compact["appearance"]:
+            if not compact['known_so_far']:
+                compact.pop('known_so_far')
+                encoded = json.dumps(compact, ensure_ascii=False)
+            while len(encoded) > per_card and compact["appearance"]:
                 compact["appearance"].pop(0)
                 encoded = json.dumps(compact, ensure_ascii=False)
             if len(encoded) > max_chars - used:
@@ -934,9 +1037,27 @@ class VisualNovelTracker:
             used += len(encoded) + 1
         return output
 
-    def _apply_character_updates(self, raw_updates: object) -> list[str]:
+    def _apply_character_updates(self, raw_updates: object, *, evidence_line_ids: list[int] | None = None, visual_evidence: str = '') -> list[str]:
         if not isinstance(raw_updates, list):
             return []
+        expanded = []
+        for update_index, raw in enumerate(raw_updates[:12]):
+            if not isinstance(raw, dict):
+                continue
+            if isinstance(raw.get('claims'), list):
+                for claim in raw['claims'][:8]:
+                    if not isinstance(claim, dict) or claim.get('field') not in {'role', 'appearance', 'known_so_far'}:
+                        continue
+                    field = claim['field']
+                    value = self._normalize(claim.get('value', ''))
+                    if value:
+                        expanded.append({**{key: raw.get(key) for key in ('id', 'name', 'aliases', 'confidence', 'entity_type', 'identity_action')},
+                            '_update_index': update_index,
+                            field: value if field == 'role' else [value],
+                            **{key: claim.get(key, '') for key in ('evidence_quote', 'visual_object', 'conflict')},
+                            'source': claim.get('source') or 'inference'})
+            else:
+                expanded.append({**raw, '_update_index': update_index})
 
         def clean_list(value: object, *, limit: int, chars: int) -> list[str]:
             if not isinstance(value, list):
@@ -951,24 +1072,45 @@ class VisualNovelTracker:
             return output
 
         changed: list[str] = []
-        evidence_ids = [int(item.get("id", 0) or 0) for item in self._lines[-6:] if item.get("id")]
-        for raw in raw_updates[:12]:
+        evidence_ids = (evidence_line_ids if evidence_line_ids is not None else
+                        [int(item.get("id", 0) or 0) for item in self._lines[-6:] if item.get("id")])
+        observed_line = max(evidence_ids, default=self._total_lines)
+        resolved_updates = {}
+        for raw in expanded:
             if not isinstance(raw, dict):
                 continue
-            requested_id = self._normalize(raw.get("id", ""))
+            requested_id = resolved_updates.get(raw['_update_index']) or self._normalize(raw.get("id", ""))
+            requested_id = self._character_redirects.get(requested_id, requested_id)
             name = self._normalize(raw.get("name", ""))[:60]
             aliases = clean_list(raw.get("aliases", []), limit=8, chars=60)
-            if not name and not aliases:
+            if not name and not aliases and requested_id not in self._characters:
                 continue
 
+            entity_type = raw.get('entity_type') or 'unknown'
+            if entity_type not in {'human', 'animal', 'other', 'unknown'}:
+                entity_type = 'unknown'
+            action = raw.get('identity_action') or ''
             character_id = requested_id if requested_id in self._characters else ""
-            if not character_id and name:
-                for existing_id, existing in self._characters.items():
-                    existing_names = [self._normalize(existing.get("name", ""))]
-                    existing_names.extend(clean_list(existing.get("aliases", []), limit=8, chars=60))
-                    if name in existing_names:
-                        character_id = existing_id
-                        break
+            candidates = [key for key, card in self._characters.items()
+                          if name and name in [card.get('name'), *card.get('aliases', []), *card.get('ocr_names', [])]]
+            compatible = [key for key in candidates if entity_type == 'unknown'
+                          or self._characters[key].get('entity_type', 'unknown') in {'unknown', entity_type}]
+            identity_error = action == 'uncertain'
+            if character_id:
+                prior_type = self._characters[character_id].get('entity_type', 'unknown')
+                forms = self._characters[character_id].get('forms', [])
+                allowed_types = {prior_type, *[form.get('entity_type') for form in forms]}
+                identity_error |= entity_type != 'unknown' and 'unknown' not in allowed_types and entity_type not in allowed_types
+            elif action != 'new':
+                if len(compatible) == 1:
+                    character_id = compatible[0]
+                elif candidates or requested_id or action == 'existing':
+                    identity_error = True
+            if identity_error:
+                self._archive.add('待归属人物信息', json.dumps(raw, ensure_ascii=False),
+                                  {'line_ids': evidence_ids, 'visual_evidence': visual_evidence,
+                                   'candidate_ids': candidates})
+                continue
             if not character_id:
                 seed = name or aliases[0]
                 digest = hashlib.sha1(
@@ -977,16 +1119,68 @@ class VisualNovelTracker:
                 character_id = f"char_{digest}"
 
             existing = dict(self._characters.get(character_id, {}))
+            claims = list(existing.get('claims', []))
+            conflict = self._normalize(raw.get('conflict', ''))
+            quote = self._normalize(raw.get('evidence_quote', ''))
+            source = str(raw.get('source', 'text'))
+            visual_object = self._normalize(raw.get('visual_object', ''))
+            status = 'conflict' if conflict else 'provisional'
+            # Identity assertions require a quote actually present in this batch.
+            evidence_text = ' '.join(str(row.get('text', '')) for row in self._lines
+                                     if row.get('id') in evidence_ids)
+            fresh_visual = bool(visual_evidence and '较早画面' not in visual_evidence
+                                and '对白已更新' not in visual_evidence
+                                and visual_object and f'对象{visual_object}（' in visual_evidence)
+            object_match = re.search(r'对象' + re.escape(visual_object) + r'（[^）]*）：\[type=(human|animal|other|unknown)\]', visual_evidence) if visual_object else None
+            if object_match and entity_type != 'unknown' and object_match[1] not in {'unknown', entity_type}:
+                fresh_visual = False
+            visual_types = {existing.get('entity_type', 'unknown'), *[form.get('entity_type') for form in existing.get('forms', [])]}
+            if object_match and 'unknown' not in visual_types and object_match[1] not in {'unknown', *visual_types}:
+                fresh_visual = False
+            if quote and quote in evidence_text and (source == 'text' or (source == 'text+visual' and fresh_visual)) and not conflict:
+                status = 'supported'
+            if not existing and not name and not fresh_visual and 'source' in raw:
+                status = 'provisional'
+            claim = {'source': source, 'quote': quote, 'visual_object': visual_object,
+                     'line_ids': evidence_ids, 'status': status, 'conflict': conflict,
+                     'visual_evidence': visual_evidence if visual_object else '',
+                     'role': raw.get('role', ''), 'appearance': raw.get('appearance', []),
+                     'known_so_far': raw.get('known_so_far', [])}
+            claims.append(claim)
+            for field in ('role', 'appearance', 'known_so_far'):
+                values = raw.get(field, [])
+                for text in ([values] if isinstance(values, str) else values):
+                    self._archive.add('历史人物资料' if status == 'supported' or 'source' not in raw else '待核对人物信息',
+                        f"{name or existing.get('name', '')}: {text} [{status}]" + (f' [冲突: {conflict}]' if conflict else ''),
+                        {'character_id': character_id, **claim})
+            if not existing and 'source' in raw and status != 'supported':
+                continue
+            if (conflict or ('source' in raw and status != 'supported')) and existing:
+                existing['claims'] = claims[-32:]
+                self._characters[character_id] = existing
+                changed.append(character_id)
+                continue
             old_name = self._normalize(existing.get("name", ""))
+            ocr_names = clean_list(existing.get('ocr_names', []), limit=16, chars=60)
+            try:
+                confidence = max(0.0, min(1.0, float(raw.get("confidence", 0.0))))
+            except (TypeError, ValueError):
+                confidence = 0.0
+            if old_name and name and name != old_name and confidence < 0.75:
+                # An uncertain OCR identity must not borrow the old identity's
+                # confidence or append its attributes to that character.
+                continue
             merged_aliases = clean_list(existing.get("aliases", []), limit=8, chars=60)
-            if old_name and name and old_name != name and old_name not in merged_aliases:
-                merged_aliases.append(old_name)
+            if old_name and name and old_name != name and name not in merged_aliases and name not in ocr_names:
+                ocr_names.append(name)
             for alias in aliases:
                 if alias != name and alias not in merged_aliases:
                     merged_aliases.append(alias)
 
             appearance = clean_list(existing.get("appearance", []), limit=8, chars=80)
             for value in clean_list(raw.get("appearance", []), limit=8, chars=80):
+                if source == 'text' and 'source' in raw and value not in evidence_text:
+                    continue
                 if value not in appearance:
                     appearance.append(value)
             known = clean_list(existing.get("known_so_far", []), limit=16, chars=120)
@@ -995,26 +1189,35 @@ class VisualNovelTracker:
                     known.append(value)
             prior_evidence = [int(value) for value in existing.get("evidence_line_ids", []) if str(value).isdigit()]
             merged_evidence = list(dict.fromkeys([*prior_evidence, *evidence_ids]))[-24:]
-            try:
-                confidence = max(0.0, min(1.0, float(raw.get("confidence", 0.0))))
-            except (TypeError, ValueError):
-                confidence = 0.0
-            confidence = max(float(existing.get("confidence", 0.0) or 0.0), confidence)
-            final_name = name or old_name
+            if not name or name == old_name:
+                confidence = max(float(existing.get("confidence", 0.0) or 0.0), confidence)
+            final_name = old_name or name
             self._characters[character_id] = {
                 "id": character_id,
                 "name": final_name,
                 "aliases": merged_aliases[-8:],
+                "ocr_names": ocr_names[-16:],
+                "entity_type": entity_type if entity_type != 'unknown' else existing.get('entity_type', 'unknown'),
+                "forms": existing.get('forms', []),
+                "identity_summary": existing.get('identity_summary', ''),
                 "role": self._normalize(raw.get("role", ""))[:100]
                 or self._normalize(existing.get("role", ""))[:100],
                 "appearance": appearance[-8:],
                 "known_so_far": known[-16:],
-                "status": "confirmed" if final_name and confidence >= 0.75 else "provisional",
+                "status": "confirmed" if final_name and confidence >= 0.75 and ('source' not in raw or status == 'supported') else "provisional",
                 "confidence": round(confidence, 4),
-                "first_seen_line": int(existing.get("first_seen_line", self._total_lines) or 0),
-                "last_seen_line": self._total_lines,
+                "first_seen_line": int(existing.get("first_seen_line", observed_line) or 0),
+                "last_seen_line": observed_line,
                 "evidence_line_ids": merged_evidence,
+                "claims": claims[-32:],
             }
+            if existing.get('forms'):
+                self._characters[character_id]['entity_type'] = 'unknown'
+                for form in self._characters[character_id]['forms']:
+                    if form.get('entity_type') == entity_type:
+                        form['appearance'] = list(dict.fromkeys([*form.get('appearance', []), *clean_list(raw.get('appearance', []), limit=8, chars=80)]))[-8:]
+                self._characters[character_id]['appearance'] = []
+            resolved_updates[raw['_update_index']] = character_id
             changed.append(character_id)
 
         if len(self._characters) > 120:
@@ -1093,6 +1296,10 @@ class VisualNovelTracker:
             return True, candidate[1]
         return False, score
 
+    def mark_reload(self, user_text: str) -> None:
+        self._branch_id = f'reload-{time.time_ns()}'
+        self._archive.add('读档边界', user_text, {'branch': self._branch_id, 'line_id': self._total_lines})
+
     def observe(self, text: str, *, confidence: float = 0.0) -> NovelObservation:
         normalized = self._normalize(text)
         if len(normalized) < 2 or self._is_duplicate(normalized):
@@ -1100,15 +1307,17 @@ class VisualNovelTracker:
             return NovelObservation(False, False, "duplicate_or_empty", 0.0)
 
         self._total_lines += 1
-        semantic_score = self._semantic_window_score(normalized)
+        semantic_score = None if self._local_reaction_enabled else self._semantic_window_score(normalized)
         self._lines.append(
             {
                 "id": self._total_lines,
+                "branch": self._branch_id,
                 "captured_at": datetime.now().isoformat(timespec="seconds"),
                 "confidence": round(max(0.0, min(1.0, float(confidence))), 4),
                 "text": normalized,
             }
         )
+        self._archive.add('原始台词', normalized, self._lines[-1])
         if len(self._lines) > self._max_lines:
             del self._lines[:-self._max_lines]
 
@@ -1117,6 +1326,8 @@ class VisualNovelTracker:
         if semantic_score is not None:
             peak_detected, reported_score = self._record_window_score(self._total_lines, semantic_score)
         if peak_detected:
+            self._pending_candidate = True
+        if self._local_reaction_enabled:
             self._pending_candidate = True
         summary_due = self._total_lines - self._summarized_line_count >= self._summary_batch_size
         should_evaluate = self._pending_candidate or summary_due
@@ -1140,6 +1351,7 @@ class VisualNovelTracker:
             last = self._lines[-1]
             if self._ocr_extends(str(last.get("text", "")), text):
                 last.update(text=text, confidence=round(confidence, 4), captured_at=datetime.now().isoformat(timespec="seconds"))
+                self._archive.add('原始台词', text, dict(last))
                 self._dirty_count += 1
                 self._last_observation_accepted = True
                 if self._dirty_count >= 5:
@@ -1192,31 +1404,85 @@ class VisualNovelTracker:
         """
         return bool(self._last_observation_accepted)
 
+    def _evaluation_lines(self) -> list[dict]:
+        unread = [row for row in self._lines if int(row.get('id', 0)) > self._summarized_line_count]
+        batch = []
+        used = 0
+        for row in unread:
+            cost = len(str(row.get('text', ''))) + 1
+            if batch and used + cost > 3600:
+                break
+            batch.append(row)
+            used += cost
+        if not batch:
+            return self._lines[-self._recent_limit:]
+        background = [row for row in self._lines if int(row.get('id', 0)) <= self._summarized_line_count]
+        keep = max(0, self._recent_limit - len(batch))
+        return (background[-keep:] if keep else []) + batch
+
+    def reserve_evaluation_snapshot(self):
+        """Reserve one evaluation without running semantic selection on the UI."""
+        if not self.has_pending_evaluation:
+            return None
+        snapshot = copy.copy(self)
+        snapshot._lines = [dict(item) for item in self._evaluation_lines()]
+        snapshot._reaction_lines = [dict(item) for item in self._lines[-5:]
+                                    if not self._local_reaction_enabled or item.get("branch") == self._branch_id]
+        snapshot._classifier_lines = [dict(item) for item in self._lines[-6:]
+                                      if item.get("branch") == self._branch_id]
+        fusion_rows = [dict(item) for item in self._lines[-8:]
+                       if item.get("branch") == self._branch_id]
+        fusion_rows += [dict(item) for item in self._local_comment_turns
+                        if item.get("branch") == self._branch_id and fusion_rows
+                        and fusion_rows[0]["id"] <= item["id"] < self._total_lines]
+        snapshot._fusion_classifier_lines = sorted(
+            fusion_rows, key=lambda item: (item["id"], bool(item.get("is_agent"))))[-8:]
+        snapshot._facts = list(self._facts)
+        snapshot._characters = copy.deepcopy(self._characters)
+        snapshot._scene_log = list(self._scene_log)
+        snapshot._viewer_notes = list(self._viewer_notes)
+        snapshot._recent_comments = list(self._recent_comments)
+        reason = "semantic_candidate" if self._pending_candidate else "summary_due"
+        self._last_requested_line_count = int(snapshot._lines[-1]['id'])
+        self._pending_candidate = False
+        return snapshot, reason
+
+    def enable_local_reactions(self, enabled: bool) -> None:
+        self._local_reaction_enabled = bool(enabled)
+
     def build_evaluation_payload(self) -> dict | None:
         if self._total_lines <= self._last_requested_line_count:
             return None
         summary_due = self._total_lines - self._summarized_line_count >= self._summary_batch_size
         if not self._pending_candidate and not summary_due:
             return None
-        self._last_requested_line_count = self._total_lines
+        recent = self._evaluation_lines()
+        self._last_requested_line_count = int(recent[-1]['id'])
         reason = "semantic_candidate" if self._pending_candidate else "summary_due"
         self._pending_candidate = False
-        recent = self._lines[-self._recent_limit :]
+        reaction_lines = [item for item in getattr(self, "_reaction_lines", self._lines[-5:])
+                          if int(item.get("id", 0)) > self._total_lines - 5]
         return {
             "reason": reason,
+            "summary_due": summary_due,
+            "local_reaction_rows": list(getattr(self, "_classifier_lines", [])),
             "story_title": self.story_title,
             "line_count": self._last_requested_line_count,
+            "evidence_line_ids": sorted({int(item["id"]) for item in recent + reaction_lines if item.get("id")}),
             "scene_summary": self._scene_summary,
             "scene_log": list(self._scene_log[-self._scene_log_limit :]),
             "facts": self._select_facts_for_context(
-                "\n".join(str(item.get("text", "")) for item in recent[-6:])
+                "\n".join(str(item.get("text", "")) for item in recent
+                          if int(item.get('id', 0)) > self._summarized_line_count)
             ),
             "characters": self._select_characters_for_context(
-                "\n".join(str(item.get("text", "")) for item in recent[-6:])
+                "\n".join(str(item.get("text", "")) for item in recent
+                          if int(item.get('id', 0)) > self._summarized_line_count)
             ),
             "viewer_notes": list(self._viewer_notes),
             "recent_dialogue": "\n".join(str(item.get("text", "")) for item in recent),
-            "reaction_dialogue": "\n".join(str(item.get("text", "")) for item in recent[-3:]),
+            "reaction_dialogue": "\n".join(f'[{item["id"]}] {item.get("text", "")}' for item in reaction_lines),
+            "reaction_line_ids": [int(item["id"]) for item in reaction_lines],
             "new_dialogue": "\n".join(
                 str(item.get("text", "")) for item in recent
                 if int(item.get("id", 0)) > self._summarized_line_count
@@ -1250,13 +1516,19 @@ class VisualNovelTracker:
         )
         self._pending_candidate = True
 
-    def remember_comment(self, comment: str) -> None:
+    def remember_comment(self, comment: str, *, evidence: dict | None = None) -> None:
         text = self._normalize(comment)[:220]
         if not text:
             return
+        self._archive.add("已显示评论", text, {
+            **(evidence or {}), "branch": self._branch_id, "displayed_line_id": self._total_lines,
+        })
         if text in self._recent_comments:
             self._recent_comments.remove(text)
         self._recent_comments.append(text)
+        self._local_comment_turns.append({"id": self._total_lines, "branch": self._branch_id,
+                                          "text": text, "is_agent": True})
+        self._local_comment_turns = self._local_comment_turns[-8:]
         if self._recent_comment_limit:
             self._recent_comments = self._recent_comments[-self._recent_comment_limit :]
         else:
@@ -1333,9 +1605,61 @@ class VisualNovelTracker:
             parts.append(f"近况{index}：{item}")
         return self._normalize("\n".join(parts))[: max_chars]
 
+    def _apply_identity_links(self, links: object, evidence_ids: list) -> None:
+        if not isinstance(links, list):
+            return
+        evidence = self._normalize(' '.join(str(row.get('text', '')) for row in self._lines
+                                            if row.get('id') in evidence_ids))
+        for link in links[:4]:
+            if not isinstance(link, dict) or link.get('relation') != 'same_entity':
+                continue
+            quote = self._normalize(link.get('evidence_quote', ''))
+            summary = self._normalize(link.get('identity_summary', ''))[:240]
+            raw_ids = link.get('character_ids', [])
+            if not isinstance(raw_ids, list) or not all(isinstance(key, str) for key in raw_ids):
+                continue
+            ids = list(dict.fromkeys(self._character_redirects.get(key, key) for key in raw_ids))
+            if len(ids) < 2 or any(key not in self._characters for key in ids):
+                continue
+            if link.get('evidence_kind') != 'explicit_identity' or not quote or quote not in evidence or not summary:
+                self._archive.add('待归属人物信息', json.dumps(link, ensure_ascii=False), {'line_ids': evidence_ids})
+                continue
+            target = ids[0]
+            cards = [self._characters[key] for key in ids]
+            merged = copy.deepcopy(cards[0])
+            forms = [form for card in cards for form in (card.get('forms') or [{
+                'original_id': card['id'], 'name': card.get('name', ''), 'entity_type': card.get('entity_type', 'unknown'),
+                'role': card.get('role', ''), 'appearance': card.get('appearance', []),
+                'known_so_far': card.get('known_so_far', []),
+                'evidence_line_ids': card.get('evidence_line_ids', [])}])]
+            merged.update(forms=forms, entity_type='unknown', identity_summary=summary, appearance=[])
+            for field, limit in [('aliases', 16), ('ocr_names', 16), ('known_so_far', 32)]:
+                merged[field] = list(dict.fromkeys(value for card in cards for value in card.get(field, [])))[-limit:]
+            merged['aliases'] = list(dict.fromkeys(merged['aliases'] + [card['name'] for card in cards
+                                              if card.get('name') and card['name'] != merged.get('name')]))[:16]
+            merged['known_so_far'].append(summary)
+            self._archive.add('身份揭示', summary, {'character_ids': ids, 'evidence_quote': quote, 'line_ids': evidence_ids,
+                                               'previous_cards': cards, 'branch': self._branch_id})
+            for old_id in ids[1:]:
+                del self._characters[old_id]
+                self._character_redirects[old_id] = target
+            for old_id, current in list(self._character_redirects.items()):
+                if current in ids:
+                    self._character_redirects[old_id] = target
+            self._characters[target] = merged
+            if summary not in self._facts:
+                self._facts.append(summary)
+
     def apply_evaluation(self, result: dict) -> None:
         if not isinstance(result, dict):
             return
+        evidence = {'line_ids': result.get('evidence_line_ids', []),
+                    'visual': result.get('visual_evidence', ''), 'branch': self._branch_id}
+        self._archive.add('剧情评估', json.dumps(result, ensure_ascii=False), evidence)
+        self._apply_identity_links(result.get('identity_links', []), result.get('evidence_line_ids', []))
+        for kind, values in [('场景', [result.get('scene_delta', '')]), ('关键事实', result.get('facts', []))]:
+            for text in values if isinstance(values, list) else []:
+                self._archive.add(kind, str(text), evidence)
         raw_viewer_notes = result.get("viewer_notes")
         if isinstance(raw_viewer_notes, list):
             self._viewer_notes = list(dict.fromkeys(
@@ -1371,6 +1695,8 @@ class VisualNovelTracker:
                 except ValueError:
                     continue
                 self._facts[index] = replacement
+                self._archive.add('事实修正', replacement, {'existing': existing, **evidence})
+                self._archive.add('关键事实', replacement, evidence)
                 updated.append(replacement)
                 if self._calibrator is not None:
                     self._calibrator.record(
@@ -1383,7 +1709,10 @@ class VisualNovelTracker:
                         }
                     )
         result["updated_characters"] = self._apply_character_updates(
-            result.get("character_updates", [])
+            [{**item, 'source': item.get('source') or 'inference'} for item in result.get('character_updates', [])
+             if isinstance(item, dict)] if result.get('require_evidence') else result.get("character_updates", []),
+            evidence_line_ids=result.get("evidence_line_ids"),
+            visual_evidence=str(result.get('visual_evidence', '')),
         )
         added: list[str] = []
         raw_facts = result.get("facts", [])

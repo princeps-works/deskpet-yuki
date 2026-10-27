@@ -21,7 +21,18 @@ def _check_menu():
         vision_change_threshold=.1, visual_novel_text_ratio=.58, vision_window_margin_px=0)
     panel = VnSidebar(settings)
     try:
-        assert [b.text() for b in panel.pages.widget(0).findChildren(QPushButton)] == ["扫描设置", "记忆设置", "剧情缓存"]
+        assert [b.text() for b in panel.pages.widget(0).findChildren(QPushButton)] == ["扫描设置", "记忆设置", "剧情缓存", "模型设置"]
+        panel.model_button.click()
+        assert panel.pages.currentIndex() == 3
+        assert [panel.filter_model.itemData(i) for i in range(panel.filter_model.count())] == [
+            "semantic", "window-linear-v64", "target-gru-fusion-r8"]
+        selected = []
+        panel.filter_model_changed.connect(selected.append)
+        panel.filter_model.setCurrentIndex(2)
+        assert selected == ["target-gru-fusion-r8"]
+        panel.set_filter_status("window-linear-v64", "本地模型已就绪")
+        assert selected == ["target-gru-fusion-r8"]
+        assert panel.filter_model.currentData() == "window-linear-v64"
         events = []
         panel.select_story_requested.connect(lambda: events.append("story"))
         panel.add_memory_requested.connect(lambda value: events.append(value))
@@ -69,7 +80,7 @@ def test_native_model_rect_preserves_negative_origin_and_dpi_scale():
         assert env[fn.name](User32(),123) == (-2560,200,round(280*scale),round(430*scale))
 
 
-def test_menu_has_three_entries_and_memory_and_scan_operations_survive_navigation():
+def test_menu_has_four_entries_and_memory_and_scan_operations_survive_navigation():
     result = subprocess.run([sys.executable, __file__, "--gui"], capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stdout + result.stderr
 

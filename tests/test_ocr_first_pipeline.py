@@ -165,3 +165,30 @@ def test_vn_line_filter_suppresses_static_text_outside_learned_dialogue_lane():
     assert "第三句" in filtered.text
     assert background.text not in filtered.text
     assert "stable_background=1" in note
+
+
+def test_single_character_speakers_survive_repeated_dialogue_but_signs_do_not():
+    from desktop_pet.vision.ocr import _result_from_lines
+    for name in ['麦', '【麦】', '【肇】']:
+        tracking = {}
+        for i in range(5):
+            name_line = OCRLine(name, .97, (.20,.60,.25,.67))
+            sign = OCRLine('店', .97, (.8,.1,.84,.15))
+            body = OCRLine(f'「这是第{i}次不同的对白。」', .99, (.20,.72,.80,.82))
+            result, _ = filter_visual_novel_ocr_result(_result_from_lines([name_line,sign,body]), tracking)
+            assert name_line in result.lines
+            if i >= 2:
+                assert sign not in result.lines
+        # A known dialogue lane also protects a name when the ellipsis was missed.
+        result, _ = filter_visual_novel_ocr_result(_result_from_lines([name_line]), tracking)
+        assert result.lines == (name_line,)
+
+
+def test_single_character_without_dialogue_geometry_is_not_permanently_protected():
+    from desktop_pet.vision.ocr import _result_from_lines
+    tracking = {}
+    for i in range(4):
+        sign = OCRLine('店', .97, (.8,.1,.84,.15))
+        body = OCRLine(f'「这是第{i}次不同的对白。」', .99, (.2,.72,.8,.82))
+        result, _ = filter_visual_novel_ocr_result(_result_from_lines([sign,body]), tracking)
+    assert sign not in result.lines

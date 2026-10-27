@@ -144,6 +144,50 @@ def test_manual_chat_reads_visual_novel_cache_as_separate_read_only_context():
         assert not memory_path.exists()
 
 
+def test_chat_followup_keeps_real_turns_and_uses_them_for_novel_retrieval():
+    class _DropRecentAttention:
+        def route(self, **kwargs):
+            return SimpleNamespace(contexts={"novel": kwargs["contexts"]["novel"]}, debug="drop_recent")
+
+    with TemporaryDirectory() as temp_dir:
+        queries = []
+        client = _FakeClient()
+        def retrieve(query):
+            queries.append(query)
+            return "剧情摘要：昨晚的仪式是对村民的伤害。" if "昨晚" in query else ""
+        mgr = DialogManager(
+            client, memory_path=Path(temp_dir) / "memory.json",
+            visual_novel_context_provider=retrieve, semantic_attention=_DropRecentAttention(),
+        )
+        mgr.record_session_message("你", "他们昨晚看到什么了？")
+        mgr.record_session_message("桌宠", "村民遭到了伤害，他们把这种事情叫仪式。")
+        for _ in range(150):
+            mgr.record_session_message("桌宠(视觉小说)", "无关自动评论")
+        mgr.reply("我说这里面的仪式啊，你回想一下")
+        assert len(queries) == 1
+        assert "他们昨晚看到什么了" in queries[0]
+        assert queries[0].count("无关自动评论") == 3
+        assert "昨晚的仪式是对村民的伤害" in client.last_user_text
+        assert "他们昨晚看到什么了" in client.last_user_text
+        assert "对话连续性" in client.last_user_text
+
+
+def test_chat_retrieval_always_separates_query_from_context():
+    with TemporaryDirectory() as temp_dir:
+        queries = []
+        mgr = DialogManager(
+            _FakeClient(), memory_path=Path(temp_dir) / "memory.json",
+            visual_novel_context_provider=lambda query: (queries.append(query) or ""),
+        )
+        mgr.record_session_message("你", "故事里的仪式是什么？")
+        mgr.record_session_message("桌宠", "这是刚才讨论的故事。")
+        for question in ("明天上海天气如何？", "换个话题，这个 Python 报错是什么？"):
+            mgr.reply(question)
+            primary, _, context = queries[-1].partition('\n最近对话中的指代线索（仅供检索）：\n')
+            assert primary == question
+            assert '故事里的仪式是什么' in context
+
+
 def test_character_query_keeps_360_chars_of_long_memory_budget():
     class _CaptureAttention:
         def __init__(self) -> None:

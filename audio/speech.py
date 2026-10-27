@@ -10,15 +10,17 @@ import threading
 import tempfile
 import time
 from html import escape
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable, Optional
 from urllib.parse import urlencode
+from urllib.error import URLError
 from urllib.request import Request, urlopen
 
 from desktop_pet.config.settings import Settings
 from desktop_pet.audio.translation import JapaneseTranslationService, TranslationStatus
+from desktop_pet.audio.gpt_sovits import GPTSoVITSClient
 
 try:
     import edge_tts
@@ -43,6 +45,18 @@ class _SpeechTask:
     on_error: Optional[Callable[[], None]] = None
     generation: int = 0
     is_valid: Optional[Callable[[], bool]] = None
+    on_ready: Optional[Callable[[], bool]] = None
+    on_end: Optional[Callable[[], None]] = None
+    _end_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def finish(self) -> None:
+        with self._end_lock:
+            callback, self.on_end = self.on_end, None
+        if callback is not None:
+            try:
+                callback()
+            except Exception:
+                pass
 
 
 class SpeechService:
@@ -58,6 +72,7 @@ class SpeechService:
         self._volume = settings.tts_volume
         self._diag = bool(getattr(settings, "tts_diag_logs", False))
         self._voicevox_clause_streaming = os.getenv("TTS_VOICEVOX_CLAUSE_STREAMING", "true").lower() in {"1", "true", "yes", "on"}
+        self._gpt_sovits_segmented = os.getenv("TTS_GPT_SOVITS_SEGMENTED", "true").lower() in {"1", "true", "yes", "on"}
         self._azure_key = settings.tts_azure_key
         self._azure_region = settings.tts_azure_region
         self._azure_endpoint = settings.tts_azure_endpoint
@@ -65,8 +80,16 @@ class SpeechService:
         self._voicevox_speaker = settings.tts_voicevox_speaker
         self._voicevox_engine_path = Path(settings.tts_voicevox_engine_path)
         self._enable_voicevox_auto_launch = settings.enable_voicevox_auto_launch
+        self._gpt_sovits = None
+        self._gpt_sovits_status = ""
+        if self._provider == "gpt_sovits":
+            self._gpt_sovits = GPTSoVITSClient(
+                settings.tts_gpt_sovits_base_url,
+                settings.tts_gpt_sovits_reference_audio,
+                settings.tts_gpt_sovits_reference_text,
+            )
         self._translation_service = None
-        if self._provider == "voicevox" and settings.enable_voicevox_ja_translation:
+        if self._provider == "gpt_sovits" or (self._provider == "voicevox" and settings.enable_voicevox_ja_translation):
             self._translation_service = JapaneseTranslationService(
                 settings,
                 api_fallback=translation_api_fallback,
@@ -85,14 +108,45 @@ class SpeechService:
         # run on the GUI thread every 20s.
         self._voicevox_engine_pid = 0
 
+        self._recovery_stop = threading.Event()
+        self._recovery_worker = None
+        if self._enabled and self._gpt_sovits is not None:
+            self._gpt_sovits.ensure_local_service()
+
         self._runtime_ok = self._compute_runtime_ok()
         self._status_message = self._build_status_message()
 
         if self._runtime_ok:
-            if self._provider in {"edge", "voicevox"}:
-                pygame.mixer.init()
-            self._worker = threading.Thread(target=self._run_worker, daemon=True)
-            self._worker.start()
+            self._start_worker()
+        if self._enabled and self._gpt_sovits is not None and pygame is not None:
+            self._recovery_worker = threading.Thread(target=self._watch_gpt_sovits, daemon=True)
+            self._recovery_worker.start()
+
+    def _start_worker(self) -> None:
+        if self._worker is not None and self._worker.is_alive():
+            return
+        if self._provider in {"edge", "voicevox", "gpt_sovits"}:
+            pygame.mixer.init()
+        self._worker = threading.Thread(target=self._run_worker, daemon=True)
+        self._worker.start()
+
+    def _watch_gpt_sovits(self) -> None:
+        while not self._recovery_stop.wait(5):
+            if self._runtime_ok:
+                continue
+            ready = self._compute_runtime_ok()
+            with self._lock:
+                if self._recovery_stop.is_set():
+                    return
+                if ready:
+                    try:
+                        self._start_worker()
+                    except Exception as exc:
+                        self._gpt_sovits_status = f"audio initialization failed: {type(exc).__name__}"
+                    else:
+                        self._runtime_ok = True
+                        self._diag_log("GPT-SoVITS recovered")
+                self._status_message = self._build_status_message()
 
     def _diag_log(self, message: str) -> None:
         if self._diag:
@@ -103,6 +157,12 @@ class SpeechService:
             return False
         if self._provider == "edge":
             return edge_tts is not None and pygame is not None
+        if self._provider == "gpt_sovits":
+            if pygame is None:
+                self._gpt_sovits_status = "pygame not installed"
+                return False
+            ready, self._gpt_sovits_status = self._gpt_sovits.check_ready()
+            return ready
         if self._provider == "azure":
             has_auth = bool(self._azure_key) and (bool(self._azure_region) or bool(self._azure_endpoint))
             return speechsdk is not None and has_auth
@@ -189,6 +249,8 @@ class SpeechService:
             if self._voicevox_status_detail:
                 return f"{self._voicevox_status_detail} (provider=voicevox)"
             return "ok (provider=voicevox)"
+        if self._provider == "gpt_sovits":
+            return self._gpt_sovits_status
         return f"unsupported provider: {self._provider}"
 
     def _check_voicevox_engine(self) -> tuple[bool, str]:
@@ -257,7 +319,9 @@ class SpeechService:
 
     def speak(self, text: str, on_start: Optional[Callable[[], None]] = None,
               on_error: Optional[Callable[[], None]] = None,
-              is_valid: Optional[Callable[[], bool]] = None) -> bool:
+              is_valid: Optional[Callable[[], bool]] = None,
+              on_ready: Optional[Callable[[], bool]] = None,
+              on_end: Optional[Callable[[], None]] = None) -> bool:
         if not self._runtime_ok:
             return False
         if self._muted:
@@ -272,7 +336,8 @@ class SpeechService:
         self._diag_log(f"enqueue provider={self._provider} chars={len(cleaned)}")
         with self._lock:
             self._queue.put(_SpeechTask(cleaned, on_start=on_start, on_error=on_error,
-                                       generation=self._generation, is_valid=is_valid))
+                                       generation=self._generation, is_valid=is_valid,
+                                       on_ready=on_ready, on_end=on_end))
         return True
 
     def set_muted(self, muted: bool) -> None:
@@ -285,17 +350,18 @@ class SpeechService:
         return self._muted
 
     def stop_current(self) -> None:
-        if not self._runtime_ok:
+        if not self._runtime_ok and getattr(self, "_worker", None) is None:
             return
         with self._lock:
             self._generation += 1
+            active_task = getattr(self, "_active_task", None)
             if self._provider == "edge":
                 try:
                     if pygame.mixer.get_init() and pygame.mixer.music.get_busy():
                         pygame.mixer.music.stop()
                 except Exception:
                     pass
-            elif self._provider == "voicevox":
+            elif self._provider in {"voicevox", "gpt_sovits"}:
                 try:
                     if pygame.mixer.get_init() and pygame.mixer.music.get_busy():
                         pygame.mixer.music.stop()
@@ -309,6 +375,9 @@ class SpeechService:
                 except Exception:
                     pass
 
+        if active_task is not None:
+            active_task.finish()
+
     def _clear_queue(self) -> None:
         while True:
             try:
@@ -320,14 +389,16 @@ class SpeechService:
                 break
 
     def shutdown(self) -> None:
-        if not self._runtime_ok:
-            return
+        recovery_stop = getattr(self, "_recovery_stop", None)
+        if recovery_stop is not None:
+            with self._lock:
+                recovery_stop.set()
         self.stop_current()
         self._queue.put(None)
         if self._worker and self._worker.is_alive():
             self._worker.join(timeout=2)
         with self._lock:
-            if self._provider in {"edge", "voicevox"}:
+            if self._provider in {"edge", "voicevox", "gpt_sovits"}:
                 try:
                     if pygame.mixer.get_init():
                         pygame.mixer.quit()
@@ -339,8 +410,10 @@ class SpeechService:
             task = self._queue.get()
             if task is None:
                 return
+            self._active_task = task
             self._active_generation = task.generation
             self._active_valid = task.is_valid
+            self._active_on_ready = task.on_ready
             if not self._is_current():
                 continue
             started_ts = time.perf_counter()
@@ -360,11 +433,17 @@ class SpeechService:
                     )
                 self._speak_once(prepared_text, task.on_start)
                 self._diag_log(f"done provider={self._provider} total={time.perf_counter() - started_ts:.3f}s")
-            except Exception:
+            except Exception as exc:
                 # Do not break app flow on TTS failures.
-                self._diag_log(f"failed provider={self._provider} total={time.perf_counter() - started_ts:.3f}s")
+                if self._provider == "gpt_sovits" and isinstance(exc, (URLError, TimeoutError, ConnectionError)):
+                    self._runtime_ok = False
+                    self._gpt_sovits_status = f"GPT-SoVITS request failed: {type(exc).__name__}; awaiting recovery"
+                    self._status_message = self._build_status_message()
+                self._diag_log(f"failed provider={self._provider} reason={type(exc).__name__} total={time.perf_counter() - started_ts:.3f}s")
                 if self._is_current():
                     self._notify_on_start(task.on_error or task.on_start)
+            finally:
+                task.finish()
 
     def _is_current(self) -> bool:
         valid = getattr(self, "_active_valid", None)
@@ -378,6 +457,9 @@ class SpeechService:
         if self._provider == "voicevox":
             self._speak_voicevox(text, on_start=on_start)
             return
+        if self._provider == "gpt_sovits":
+            self._speak_gpt_sovits(text, on_start)
+            return
         if self._provider == "azure":
             self._speak_azure(text, on_start=on_start)
 
@@ -390,11 +472,18 @@ class SpeechService:
         except Exception:
             pass
 
+    def _await_playback_ready(self) -> bool:
+        ready = getattr(self, "_active_on_ready", None)
+        self._active_on_ready = None
+        return self._is_current() and (ready is None or ready() is not False) and self._is_current()
+
     def _speak_edge(self, text: str, on_start: Optional[Callable[[], None]] = None) -> None:
         fd, tmp_path = tempfile.mkstemp(prefix="pet_tts_", suffix=".mp3")
         os.close(fd)
         try:
             asyncio.run(self._synthesize_to_file(text, tmp_path))
+            if not self._await_playback_ready():
+                return
             with self._lock:
                 if not self._is_current():
                     return
@@ -415,6 +504,45 @@ class SpeechService:
                 os.remove(tmp_path)
             except OSError:
                 pass
+
+    @staticmethod
+    def _gpt_sovits_parts(text: str) -> list[str]:
+        output = []
+        for sentence in re.split(r"(?<=[。！？!?])\s*", text):
+            part = sentence.strip()
+            while len(part) > 28:
+                boundaries = [match.end() for match in re.finditer(r"[、，,；;]|…{2,}|\.{3,}", part)
+                              if 8 <= match.end() <= len(part) - 8]
+                if not boundaries:
+                    break
+                split = min(boundaries, key=lambda index: abs(index - 24))
+                output.append(part[:split].strip())
+                part = part[split:].strip()
+            if part:
+                output.append(part)
+        return output
+
+    def _speak_gpt_sovits(self, text: str, on_start=None) -> None:
+        parts = (self._gpt_sovits_parts(text) if getattr(self, "_gpt_sovits_segmented", True)
+                 else [text])
+        def prepare(part):
+            if not self._is_current():
+                return b""
+            started = time.perf_counter()
+            audio = self._gpt_sovits.synthesize(part)
+            self._diag_log(f"gpt_sovits synthesis={time.perf_counter() - started:.3f}s chars={len(part)}")
+            return audio
+        if not parts:
+            return
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="gpt-sovits-synthesis") as executor:
+            pending = executor.submit(prepare, parts[0])
+            for index in range(len(parts)):
+                audio = pending.result()
+                if not self._is_current() or not audio:
+                    return
+                if index + 1 < len(parts):
+                    pending = executor.submit(prepare, parts[index + 1])
+                self._play_voicevox(audio, on_start if index == 0 else None)
 
     @staticmethod
     def _voicevox_parts(text: str, *, split_clauses: bool = True) -> list[str]:
@@ -466,6 +594,8 @@ class SpeechService:
             with open(tmp_path, "wb") as f:
                 f.write(wav_bytes)
 
+            if not self._await_playback_ready():
+                return
             with self._lock:
                 if not self._is_current():
                     return

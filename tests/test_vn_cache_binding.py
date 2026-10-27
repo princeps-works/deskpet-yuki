@@ -39,7 +39,21 @@ def test_populated_legacy_cache_requires_confirmation_before_binding():
 
 def test_guard_runs_before_ocr_enters_story_memory():
     source = Path(main_module.__file__).read_text(encoding="utf-8")
-    handler = source[source.index("    def _process_visual_novel_text("):source.index("    def _sync_plot_memory(")]
+    handler = source[source.index("    def _process_visual_novel_text("):source.index("    def _retry_visual_novel_evaluation(")]
     assert handler.index("if not _check_game_window_change():") < handler.index("visual_novel_tracker.observe_ocr(")
     assert "return" in handler[handler.index("if not _check_game_window_change():"):handler.index("visual_novel_tracker.observe_ocr(")]
     assert GameWindowResolver._is_unlikely_target("ChatGPT")
+
+
+def test_same_game_title_whitespace_survives_cache_binding_and_reload():
+    title = '国王恋爱 【gemini-3.1-pro-preview v1.2】 Made by 花咲夜机翻组\u3000|\u3000julixian'
+    with TemporaryDirectory() as temp_dir:
+        path = VisualNovelStoryLibrary(Path(temp_dir)).create('国王恋爱')
+        tracker = VisualNovelTracker(path)
+        tracker.bind_game_title(title)
+        restored = VisualNovelTracker(path)
+        for captured in [title, title.replace('\u3000', ' '), title.replace('\u3000', '  ')]:
+            assert main_module.story_cache_game_status(restored.game_title, False, captured) == 'match'
+            assert main_module.story_cache_game_status(restored.game_title, True, captured) == 'match'
+        other = title.replace('国王恋爱', '另一款游戏')
+        assert main_module.story_cache_game_status(restored.game_title, True, other) == 'mismatch'

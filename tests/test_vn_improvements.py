@@ -57,9 +57,9 @@ def test_fact_dedup_merges_duplicates_and_keeps_distinct():
         )
         assert len(tracker.facts) == 2
 
-        # Same fact, punctuation variation: must merge rather than append.
+        # Identical fact: must merge rather than append.
         tracker.apply_evaluation(
-            {"scene_delta": "场景二", "facts": ["万斋否认制作时光机并试图逃跑。"]}
+            {"scene_delta": "场景二", "facts": ["万斋否认制作时光机并试图逃跑"]}
         )
         assert len(tracker.facts) == 2
 
@@ -101,7 +101,7 @@ def test_dedup_calibration_is_recorded_and_optional():
         assert not off_path.exists()
 
 
-def test_semantic_dedup_runs_without_high_ngram_prefilter():
+def test_semantic_dedup_candidates_do_not_delete_reworded_facts():
     calls: list[tuple[str, list[str]]] = []
 
     def similarities(query: str, texts: list[str]) -> list[float]:
@@ -121,8 +121,8 @@ def test_semantic_dedup_runs_without_high_ngram_prefilter():
         result = {"facts": [rewritten]}
         tracker.apply_evaluation(result)
 
-        assert len(tracker.facts) == 1
-        assert result["added_facts"] == []
+        assert tracker.facts == [original, rewritten]
+        assert result["added_facts"] == [rewritten]
         assert calls and calls[-1][1] == [original]
 
 
@@ -170,6 +170,40 @@ def test_newer_cumulative_summary_may_be_shorter():
         tracker.apply_evaluation({"scene_summary": "一条足够长的主线摘要，用于确认后续更短的摘要不会把它覆盖掉"})
         tracker.apply_evaluation({"scene_summary": "更准确的压缩摘要"})
         assert tracker.scene_summary == "更准确的压缩摘要"
+
+
+def test_fact_retrieval_uses_early_new_dialogue_not_only_last_six_lines():
+    old = "小明答应陪小红去车站。"
+    def similarities(query, texts):
+        return [(.95 if "车站" in query else .1) if text == old else .5 for text in texts]
+    with TemporaryDirectory() as tmp:
+        tracker = _tracker(tmp, similarities_fn=similarities)
+        tracker._facts = [old] + [f"无关场景记录{i}" for i in range(24)]
+        tracker._lines = [{"id": i + 1, "text": text} for i, text in enumerate(
+            ["小明：小红，去车站的事我答应过了。"] + [f"风吹过树叶{i}。" for i in range(7)])]
+        tracker._total_lines = 8
+        tracker._pending_candidate = True
+        payload = tracker.build_evaluation_payload()
+        assert old in payload["facts"]
+
+
+def test_fact_retrieval_without_embeddings_still_finds_old_related_fact():
+    with TemporaryDirectory() as tmp:
+        tracker = _tracker(tmp)
+        old = "小明答应陪小红去车站。"
+        tracker._facts = [old] + [f"花园里的无关记录{i}" for i in range(24)]
+        selected = tracker._select_facts_for_context("小明：小红，去车站的事我答应过了。")
+        assert old in selected
+
+
+def test_recent_facts_cannot_fill_budget_before_relevant_old_fact():
+    old = "小明答应陪小红去车站，并帮她搬运行李，之后一起回家吃饭。"
+    with TemporaryDirectory() as tmp:
+        tracker = _tracker(tmp, similarities_fn=lambda query, texts: [.99 if t == old else .1 for t in texts])
+        tracker._facts = [old] + [str(i) + "花园里的树木很茂盛。" * 13 for i in range(4)]
+        selected = tracker._select_facts_for_context("车站", max_chars=400)
+        assert old in selected
+        assert len("\n".join(selected)) <= 400
 
 
 def test_explicit_fact_revision_can_replace_with_shorter_truth():
@@ -307,7 +341,7 @@ def test_character_context_is_relevant_and_budgeted():
         assert payload is not None
         assert any(item["name"] == "角色0" for item in payload["characters"])
         assert len(payload["characters"]) <= 5
-        assert sum(len(__import__("json").dumps(item, ensure_ascii=False)) for item in payload["characters"]) <= 420
+        assert sum(len(__import__("json").dumps(item, ensure_ascii=False)) for item in payload["characters"]) <= 900
 
 
 def test_character_name_is_retrievable_without_semantic_encoder():

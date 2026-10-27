@@ -99,17 +99,24 @@ def test_sampler_loop_ticks_at_one_second_by_default():
     start = source.find("def _vision_sampler_loop")
     assert start != -1
     body = source[start : source.find("vision_sampler_thread", start)]
-    assert "wait = 1.0" in body, "the default sampler tick should be one second"
-    assert "vision_sampler_stop.wait(" in body
+    assert "vision_sampler_stop.wait(1.0)" in body
 
 
-def test_sampler_sleeps_out_the_gap_instead_of_polling():
-    """While the floor is binding there is nothing to do, so it may sleep."""
-    source = _MAIN.read_text(encoding="utf-8")
-    start = source.find("def _vision_sampler_loop")
-    body = source[start : source.find("vision_sampler_thread", start)]
-    assert "min_gap" in body, "the loop should account for the minimum gap"
-    assert "wait = max(" in body, "the loop should extend its sleep to clear the gap"
+def test_sampler_keeps_polling_results_and_art_during_api_gap():
+    tree = ast.parse(_MAIN.read_text(encoding="utf-8"))
+    node = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_vision_sampler_loop")
+    calls, waits = [], []
+    class Stop:
+        def is_set(self):
+            return len(waits) == 2
+        def wait(self, seconds):
+            waits.append(seconds)
+    ns = dict(vision_sampler_stop=Stop(), poll_vision_future=lambda: calls.append("poll"),
+              vision_sampling_step=lambda: calls.append("art"))
+    exec(compile(ast.Module(body=[node], type_ignores=[]), "main.py", "exec"), ns)
+    ns["_vision_sampler_loop"]()
+    assert waits == [1.0, 1.0]
+    assert calls == ["poll", "art", "poll", "art"]
 
 
 # --- minimum gap floor -------------------------------------------------------

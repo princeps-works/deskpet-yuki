@@ -105,8 +105,45 @@ def test_index_failure_falls_back_without_poisoning_cache():
         assert service.translate("吓死我了") == "怖かった！"
         assert len(calls) == 1
         service._index_opener = _IndexResponse("びっくりした！")
+        service._index_retry_after = 0  # The failed endpoint is probed again after recovery delay.
         assert service.translate("吓死我了") == "びっくりした！"
         assert len(calls) == 1
+
+
+def test_index_outage_uses_working_fallback_without_repeated_timeout_and_recovers():
+    from unittest.mock import patch
+    with TemporaryDirectory() as temp_dir:
+        service=JapaneseTranslationService(_settings(temp_dir,provider="index"))
+        requests=[]
+        def index(_):
+            requests.append(True)
+            return "" if len(requests)==1 else "大丈夫です。"
+        service._translate_index=index
+        service._translate_local=lambda _:"心配しないで。"
+        with patch("desktop_pet.audio.translation.time.monotonic",return_value=100):
+            assert service.translate("第一句担心")=="心配しないで。"
+        with patch("desktop_pet.audio.translation.time.monotonic",return_value=110):
+            assert service.translate("第二句担心")=="心配しないで。"
+            assert len(requests)==1
+        with patch("desktop_pet.audio.translation.time.monotonic",return_value=131):
+            assert service.translate("第三句担心")=="大丈夫です。"
+            assert len(requests)==2  # Fallback use did not slide the retry deadline forward.
+
+
+def test_failed_local_fallback_does_not_lock_out_online_recovery():
+    from unittest.mock import patch
+    with TemporaryDirectory() as temp_dir:
+        service=JapaneseTranslationService(_settings(temp_dir,provider="index"))
+        service._translate_index=lambda _:""
+        service._translate_local=lambda _:"心配しないで。"
+        with patch("desktop_pet.audio.translation.time.monotonic",return_value=100):
+            assert service.translate("担心第一句")
+        service._translate_local=lambda _:""
+        with patch("desktop_pet.audio.translation.time.monotonic",return_value=101):
+            assert service.translate("担心第二句")==""
+        service._translate_index=lambda _:"大丈夫です。"
+        with patch("desktop_pet.audio.translation.time.monotonic",return_value=102):
+            assert service.translate("担心第三句")=="大丈夫です。"
 
 
 def test_index_invalid_output_and_local_failure_never_leak_chinese():

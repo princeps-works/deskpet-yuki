@@ -85,6 +85,57 @@ def _diary(summary: str, timestamp: str = "2026-08-28T12:00:00+08:00") -> dict[s
     }
 
 
+def test_plot_history_does_not_fill_diary_or_generic_recall_and_is_retained():
+    with TemporaryDirectory() as directory:
+        path = Path(directory) / "memory.json"
+        store = MemoryStore(path, diary_limit=20)
+        for i in range(20):
+            store.add_diary(_diary(f"和哥哥的一轮交流-{i}"))
+        for i in range(25):
+            plot = {**_diary(f"《作品》剧情进展-{i}"), "source_type": "screen_plot"}
+            store.add_diary(plot, [{"subject": "作品", "predicate": "发生", "object": f"剧情事件-{i}", "slot": "knowledge"}])
+        assert len(store.list_diaries()) == 20
+        assert len(json.loads(path.read_text(encoding="utf-8"))) == 20
+        assert all(row["source_type"] != "screen_plot" for row in store.candidates("作品剧情事件"))
+        with store._connect() as connection:
+            assert connection.execute("SELECT COUNT(*) FROM memory_items WHERE source_type='screen_plot'").fetchone()[0] == 50
+        connection.close()
+        store.add_diary(_diary("新一轮交流总结"))
+        assert len(store.list_diaries()) == 20
+        assert store.list_diaries()[-1]["summary"] == "新一轮交流总结"
+        assert store.list_diaries()[0]["summary"] == "和哥哥的一轮交流-1"
+        # SQLite transaction contexts do not close connections on Windows.
+        import gc
+        gc.collect()
+
+
+def test_chat_still_reads_active_story_after_plot_diaries_are_excluded():
+    from desktop_pet.llm.visual_novel import VisualNovelTracker
+    with TemporaryDirectory() as directory:
+        path = Path(directory)
+        tracker = VisualNovelTracker(path / "作品A.json", similarities_fn=lambda q, ts: [.8] * len(ts))
+        tracker.apply_evaluation({"scene_summary": "萤与焕被树木墙挡住去路。"})
+        class Client:
+            def chat(self, user_text, system_prompt):
+                self.prompt = user_text
+                return "测试响应"
+        client = Client()
+        manager = DialogManager(client, memory_path=path / "diary.json",
+                                visual_novel_context_provider=tracker.retrieve_for_query)
+        manager.append_plot_memory(story_title="旧作品", digest="无关作品的结局旧记录", facts=["已经通关旧作品。"])
+        manager.reply("刚才的剧情发生了什么？")
+        assert "视觉小说历史缓存" in client.prompt and "树木墙" in client.prompt
+        assert "结局旧记录" not in client.prompt
+        assert manager.list_long_memory() == []
+        other = VisualNovelTracker(path / "作品B.json")
+        other.apply_evaluation({"scene_summary": "小狗在公园里找到了主人。"})
+        tracker.switch_story(other.path)
+        manager.reply("当前作品的剧情是什么？")
+        assert "小狗" in client.prompt and "树木墙" not in client.prompt
+        import gc
+        gc.collect()
+
+
 def test_legacy_json_is_migrated_without_being_deleted():
     with TemporaryDirectory() as temp_dir:
         path = Path(temp_dir) / "memory.json"
@@ -209,3 +260,157 @@ def test_memory_embeddings_are_reused_after_restart():
         assert second._rank_memory_candidates("魔裁人物", top_k=3)
 
         assert second_encoder.calls == [["魔裁人物"]]
+
+
+def test_semantic_recall_finds_old_memory_without_keyword_overlap():
+    class Encoder(_CountingEncoder):
+        def encode(self, texts):
+            self.calls.append(list(texts))
+            return np.asarray([[1., 0.] if text in {
+                "幽暗走廊让我发抖，希望你多说几句", "惊悚作品陪伴方式"
+            } else [0., 1.] for text in texts], dtype=np.float32)
+
+    with TemporaryDirectory() as directory:
+        path = Path(directory) / "memory.json"
+        entries = [_diary("幽暗走廊让我发抖，希望你多说几句")]
+        entries.extend(_diary(f"例行记录-{i}") for i in range(150))
+        path.write_text(json.dumps(entries, ensure_ascii=False), encoding="utf-8")
+        encoder = Encoder()
+        router = SemanticAttentionRouter(enabled=True, model_path=Path(directory), encoder=encoder)
+        manager = DialogManager(_NoopClient(), path, semantic_attention=router)
+        recalled = manager._rank_memory_candidates("惊悚作品陪伴方式", top_k=3)
+        assert recalled and recalled[0]["summary"] == entries[0]["summary"]
+        assert max(map(len, encoder.calls)) <= 32
+        next_encoder = Encoder()
+        restarted = DialogManager(_NoopClient(), path, semantic_attention=SemanticAttentionRouter(
+            enabled=True, model_path=Path(directory), encoder=next_encoder))
+        assert restarted._rank_memory_candidates("惊悚作品陪伴方式", top_k=3)[0]["summary"] == entries[0]["summary"]
+        assert next_encoder.calls == [["惊悚作品陪伴方式"]]
+
+
+def test_superseded_fact_cannot_return_through_any_parent_summary():
+    with TemporaryDirectory() as directory:
+        store = MemoryStore(Path(directory) / "memory.json")
+        fact = {"subject": "用户", "predicate": "夜间语音", "object": "开启", "policy": "replace"}
+        old = store.add_diary(_diary("夜间语音开启，喜欢听桌宠说话"), [fact])
+        duplicate = store.add_diary(_diary("再次确认夜间语音开启"), [fact])
+        store.add_diary(_diary("夜间语音关闭"), [{**fact, "object": "关闭"}])
+        recalled = store.candidates("夜间语音开启")
+        assert old not in {r["id"] for r in recalled}
+        assert duplicate not in {r["id"] for r in recalled}
+        assert not any("开启" in r["summary"] for r in recalled)
+        assert len(store.list_diaries()) == 3  # Historical diary remains readable.
+
+
+def test_source_transcript_is_exact_and_survives_diary_retention():
+    with TemporaryDirectory() as directory:
+        path = Path(directory) / "memory.json"
+        store = MemoryStore(path, diary_limit=20)
+        transcript = "你: 记住这句话：\n  我喜欢安静。\n桌宠: 好。"
+        store.add_diary(_diary("用户喜欢安静"), [
+            {"subject": "用户", "predicate": "喜欢", "object": "安静"}
+        ], source_transcript=transcript)
+        fact = next(r for r in store.candidates("安静") if r["kind"] == "fact")
+        for i in range(20):
+            store.add_diary(_diary(f"后续日记{i}"))
+        restarted = MemoryStore(path, diary_limit=20)
+        evidence = restarted.read_evidence(fact["id"])
+        assert evidence["status"] == "success"
+        assert evidence["sources"][0]["transcript"] == transcript
+
+
+def test_expired_sibling_blocks_full_source_but_keeps_live_fact():
+    with TemporaryDirectory() as directory:
+        store = MemoryStore(Path(directory) / "memory.json")
+        diary = store.add_diary(_diary("用户喜欢安静，临时状态已过期"), [
+            {"subject": "用户", "predicate": "喜欢", "object": "安静"},
+            {"subject": "用户", "predicate": "临时状态", "object": "旧值", "expires_at": "2020-01-01"},
+        ], source_transcript="你: 喜欢安静，临时状态是旧值。")
+        rows = store.candidates("安静")
+        assert diary not in {r["id"] for r in rows}
+        fact = next(r for r in rows if r["kind"] == "fact")
+        evidence = store.read_evidence(fact["id"])
+        assert evidence["status"] == "success"
+        assert evidence["sources"] == []
+        assert evidence["source_status"] == "lifecycle_limited"
+
+
+def test_legacy_database_migration_filters_stale_diary_without_inventing_source():
+    with TemporaryDirectory() as directory:
+        path = Path(directory) / "memory.json"
+        store = MemoryStore(path)
+        old = store.add_diary(_diary("旧语音开启"), [
+            {"subject": "用户", "predicate": "语音", "object": "开启", "policy": "replace"}])
+        store.add_diary(_diary("新语音关闭"), [
+            {"subject": "用户", "predicate": "语音", "object": "关闭", "policy": "replace"}])
+        with store._connect() as db:
+            db.execute("DROP TABLE memory_source_links")
+            db.execute("DROP TABLE memory_sources")
+        db.close()
+        migrated = MemoryStore(path)
+        rows = migrated.candidates("语音")
+        assert old not in {r["id"] for r in rows}
+        fact = next(r for r in rows if r["kind"] == "fact")
+        assert migrated.read_evidence(fact["id"])["source_status"] == "unavailable"
+        assert migrated.read_evidence(old)["status"] == "lifecycle_limited"
+        assert len(migrated.list_diaries()) == 2
+
+
+def test_archive_preserves_source_and_current_memory_reaches_final_prompt():
+    class Client(_ArchiveClient):
+        def chat(self, user_text, system_prompt):
+            self.prompt = user_text
+            if "JSON" in system_prompt:
+                return super().chat(user_text, system_prompt)
+            return "ok"
+
+    with TemporaryDirectory() as directory:
+        client = Client()
+        manager = DialogManager(client, Path(directory) / "memory.json")
+        transcript = "你: 我开始玩樱云了，而且不要给我剧透。"
+        manager.archive_transcript(transcript)
+        fact = next(r for r in manager._memory_store.candidates("剧透") if r["kind"] == "fact")
+        assert manager._memory_store.read_evidence(fact["id"])["sources"][0]["transcript"] == transcript
+        store = manager._memory_store
+        old_fact = {"subject": "用户", "predicate": "夜间语音", "object": "开启", "policy": "replace"}
+        store.add_diary(_diary("夜间语音开启"), [old_fact])
+        store.add_diary(_diary("夜间语音关闭"), [{**old_fact, "object": "关闭"}])
+        manager.reply("我的夜间语音偏好是什么？")
+        assert "夜间语音关闭" in client.prompt and "夜间语音开启" not in client.prompt
+        assert "memory_id=" in client.prompt
+        assert "夜间语音开启" not in manager._build_long_memory_block()
+        manager.build_opening_greeting()
+        assert "夜间语音开启" not in client.prompt
+
+
+def test_unavailable_encoder_keeps_lexical_recall_and_lifecycle_filter():
+    class Encoder:
+        status = "unavailable"
+        def encode(self, texts):
+            raise RuntimeError("offline encoder")
+
+    with TemporaryDirectory() as directory:
+        manager = DialogManager(_NoopClient(), Path(directory) / "memory.json",
+                                semantic_attention=SemanticAttentionRouter(
+                                    enabled=True, model_path=Path(directory), encoder=Encoder()))
+        manager._memory_store.add_diary(_diary("用户喜欢草莓"))
+        expired = manager._memory_store.add_diary({**_diary("用户喜欢草莓旧记录"), "expires_at": "2020-01-01"})
+        rows = manager._rank_memory_candidates("草莓", top_k=3)
+        assert rows and rows[0]["summary"] == "用户喜欢草莓"
+        assert expired not in {r["id"] for r in rows}
+
+
+def test_recent_records_do_not_displace_better_old_semantic_match():
+    class Encoder(_CountingEncoder):
+        def encode(self, texts):
+            return np.asarray([[1., 0.] if text == "question" else
+                               [.6, .8] if text == "旧约定" else
+                               [.58, np.sqrt(1 - .58 ** 2)] for text in texts], dtype=np.float32)
+
+    with TemporaryDirectory() as directory:
+        path = Path(directory) / "memory.json"
+        path.write_text(json.dumps([_diary("旧约定"), *[_diary(f"新记录{i}") for i in range(100)]],
+                                   ensure_ascii=False), encoding="utf-8")
+        manager = DialogManager(_NoopClient(), path, semantic_attention=SemanticAttentionRouter(
+            enabled=True, model_path=Path(directory), encoder=Encoder()))
+        assert manager._rank_memory_candidates("question", top_k=1)[0]["summary"] == "旧约定"

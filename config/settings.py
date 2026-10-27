@@ -143,6 +143,13 @@ class Settings:
     screen_scan_interval_sec: int
     auto_comment_cooldown_sec: int
     pet_image_path: Path
+    tts_gpt_sovits_base_url: str = "http://127.0.0.1:9880"
+    tts_gpt_sovits_reference_audio: str = ""
+    tts_gpt_sovits_reference_text: str = ""
+    enable_vn_reaction_classifier: bool = False
+    vn_reaction_model_path: str = ""
+    vn_reaction_cpu_threads: int = 4
+    vn_reaction_filter_model: str = ""
 
 
 def _parse_scan_region(value: str) -> Optional[Tuple[int, int, int, int]]:
@@ -696,6 +703,12 @@ def load_settings(base_dir: Path) -> Settings:
         dedup_calibration_enabled=dedup_calibration_enabled,
         dedup_calibration_path=dedup_calibration_path,
         visual_novel_max_facts=visual_novel_max_facts,
+        enable_vn_reaction_classifier=os.getenv("ENABLE_VN_REACTION_CLASSIFIER", "false").lower() in {"1", "true", "yes", "on"},
+        vn_reaction_model_path=_resolve_project_path(
+            base_dir, os.getenv("VN_REACTION_MODEL_PATH", ""),
+            base_dir / "assets" / "models" / "vn-reaction-v64"),
+        vn_reaction_cpu_threads=max(1, min(8, int(os.getenv("VN_REACTION_CPU_THREADS", "4")))),
+        vn_reaction_filter_model=os.getenv("VN_REACTION_FILTER_MODEL", "").strip(),
         enable_ocr_first_routing=enable_ocr_first_routing,
         ocr_only_min_chars=ocr_only_min_chars,
         ocr_only_min_confidence=ocr_only_min_confidence,
@@ -728,6 +741,12 @@ def load_settings(base_dir: Path) -> Settings:
         enable_tutor_persona=enable_tutor_persona,
         enable_tts=enable_tts,
         tts_provider=tts_provider,
+        tts_gpt_sovits_base_url=os.getenv("TTS_GPT_SOVITS_BASE_URL", "http://127.0.0.1:9880"),
+        tts_gpt_sovits_reference_audio=_resolve_project_path(
+            base_dir, os.getenv("TTS_GPT_SOVITS_REFERENCE_AUDIO", ""),
+            base_dir / "VOICE_model" / "GPT_weights_v2ProPlus" / "tsumugi" / "reference_01.wav",
+        ),
+        tts_gpt_sovits_reference_text=os.getenv("TTS_GPT_SOVITS_REFERENCE_TEXT", ""),
         tts_voice=tts_voice,
         tts_rate=tts_rate,
         tts_volume=tts_volume,

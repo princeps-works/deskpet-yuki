@@ -82,7 +82,7 @@ if __package__ is None or __package__ == "":
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from desktop_pet.config.settings import load_settings
-from desktop_pet.vision.ocr import warmup_ocr_engine
+from desktop_pet.vision.ocr import strip_ui_chrome, warmup_ocr_engine
 from desktop_pet.config.prompts import SYSTEM_VOICEVOX_TRANSLATE_PROMPT
 
 
@@ -133,6 +133,13 @@ def _frame_fingerprint(image, *, text_sensitive: bool = False) -> bytes:
     size = (96, 36) if text_sensitive else (32, 18)
     gray = image.convert("L").resize(size)
     return gray.tobytes()
+
+
+def _vn_visual_fingerprint(image, text_ratio: float) -> bytes:
+    """Compare the art above the dialogue band, without another OCR pass."""
+    width, height = image.size
+    bottom = max(1, int(height * max(0.2, min(0.95, text_ratio))))
+    return _frame_fingerprint(image.crop((0, 0, width, bottom)))
 
 
 def _fingerprint_diff_ratio(a: bytes, b: bytes) -> float:
@@ -415,56 +422,6 @@ def _crop_text_band(image, top_ratio: float, *, bottom_margin: float = 0.0):
     return image.crop((0, top, width, bottom))
 
 
-# The game's bottom bar is read as one glued run -- "SAVELOADCONFIGSKIPAUTOLOG
-# Q.SAVEQ.LOAD" -- so the tokens are matched as a run first, which cannot damage
-# a real word, and only then as standalone words.
-_UI_CHROME_WORDS = (
-    "Q.SAVE",
-    "Q.LOAD",
-    "QUICKSAVE",
-    "QUICKLOAD",
-    "BACKLOG",
-    "CONFIG",
-    "SKIP",
-    "AUTO",
-    "SAVE",
-    "LOAD",
-    "LOG",
-    "MENU",
-    "HISTORY",
-    "TITLE",
-    "HIDE",
-)
-_UI_CHROME_TOKEN = "(?:" + "|".join(re.escape(word) for word in _UI_CHROME_WORDS) + ")"
-_UI_CHROME_RUN = re.compile(
-    rf"(?i){_UI_CHROME_TOKEN}(?:[\s._\-|]*{_UI_CHROME_TOKEN})+"
-)
-_UI_CHROME_ALONE = re.compile(
-    rf"(?i)(?<![A-Za-z0-9])(?:{_UI_CHROME_TOKEN})(?![A-Za-z0-9])"
-)
-
-
-def strip_ui_chrome(text: str) -> str:
-    """Remove the game's menu-bar words from OCR text.
-
-    The bottom bar sits inside the captured band, and OCR returns it glued to the
-    dialogue. ``prepare_ocr_text`` accepts that mixture as ``quality_ok``, so
-    without this the chrome is stored as if the player had read it out -- the
-    user's own cache contains the fact "台词中混有SAVE/LOAD/Q.SAVE/Q.LOAD等界面
-    文本". Stripping here keeps both the tracker and the panel on the real words.
-
-    ASCII-only tokens, so Chinese dialogue is untouched, and a lone token needs a
-    non-alphanumeric boundary (``DIALOGUE`` keeps its "LOG").
-    """
-    value = str(text or "")
-    if not value:
-        return ""
-    value = _UI_CHROME_RUN.sub(" ", value)
-    value = _UI_CHROME_ALONE.sub(" ", value)
-    value = re.sub(r"[ \t\u3000]{2,}", " ", value)
-    return value.strip(" \t\u3000")
-
-
 def should_run_band_sweep(
     *,
     vn_mode: bool,
@@ -601,6 +558,11 @@ def _resolve_vn_capture(
                 process_name=str(getattr(window_rect, "process_name", "") or ""),
             )
         cropped = _crop_region(ocr_frame, interior_region)
+        if cropped is not None and vision_region is None:
+            left, top, width, height = interior_region
+            cropped.info['vn_ocr_box'] = (max(0, left) / ocr_frame.width, max(0, top) / ocr_frame.height,
+                                          min(ocr_frame.width, left + width) / ocr_frame.width,
+                                          min(ocr_frame.height, top + height) / ocr_frame.height)
         ocr_warning = str(getattr(_crop_region, "warning", "") or "")
         if ocr_warning:
             warnings.append(f"文本区：{ocr_warning}")
@@ -625,8 +587,14 @@ def _resolve_vn_capture(
                 pass
         # Fall back to the lower band of whatever frame we ended up with, minus
         # the game's bottom UI bar (see _crop_text_band).
+        text_image = _crop_text_band(ocr_frame, text_ratio, bottom_margin=text_bottom_margin)
+        if vision_region is None:
+            top = round(ocr_frame.height * max(.2, min(.95, text_ratio)))
+            bottom = round(ocr_frame.height * (1 - max(0, min(.4, text_bottom_margin))))
+            text_image.info['vn_ocr_box'] = ((0, top / ocr_frame.height, 1, bottom / ocr_frame.height)
+                                              if text_image is not ocr_frame else (0, 0, 1, 1))
         return (
-            _crop_text_band(ocr_frame, text_ratio, bottom_margin=text_bottom_margin),
+            text_image,
             window_rect,
             vision_image,
             source,
@@ -770,7 +738,7 @@ def normalize_game_title(title: str) -> str:
     value = re.sub(
         r"\s*v?\d+(?:\.\d+)+(?:[-_ ]\S+)*\s*$", "", value, flags=re.IGNORECASE
     )
-    return value.strip(" -_·|~—")
+    return " ".join(value.split()).strip(" -_·|~—")
 
 
 def game_title_changed(previous: str, current: str) -> bool:
@@ -1320,12 +1288,13 @@ def run_scan_pipeline_subprocess(
     if visual_novel_mode and image.info.get("vn_ui_mask"):
         ocr_info += f"+ui_mask={image.info['vn_ui_mask']}:{image.info['vn_ui_mask_ms']:g}ms"
     if visual_novel_mode:
-        text_edge = int(getattr(subproc_settings, "ocr_text_max_edge", 800) or 800)
+        text_edge = int(getattr(subproc_settings, "ocr_text_max_edge", 800))
         text_image = _resize_for_ocr(image, text_edge)
         ocr_result = extract_ocr_result(text_image)
     else:
         ocr_image = _resize_for_ocr(image, int(ocr_max_edge))
         ocr_result = extract_ocr_result(ocr_image)
+    speaker_layout = {}
     if visual_novel_mode:
         ocr_result, filter_note = filter_visual_novel_ocr_result(
             ocr_result,
@@ -1333,6 +1302,18 @@ def run_scan_pipeline_subprocess(
         )
         if filter_note:
             ocr_info = f"{ocr_info}+vn_filter({filter_note})"
+        if ocr_region is None and vision_region is None:
+            from desktop_pet.vision.vn_speaker import correct_camus_speaker
+            ocr_result, name_note = correct_camus_speaker(
+                ocr_result, _vision_image, title=str(getattr(window_rect, "title", "") or ""),
+                process_name=str(getattr(window_rect, "process_name", "") or ""),
+                text_ratio=text_ratio, bottom_margin=float(getattr(subproc_settings, "vn_text_band_bottom_margin", 0.0)),
+            )
+            if name_note:
+                ocr_info += "+" + name_note
+        from desktop_pet.vision.speaker_layout import observe_speaker_layout
+        ocr_result, speaker_layout = observe_speaker_layout(
+            ocr_result, image, _vision_image, window_rect, _SUBPROC_SCAN_CACHE)
     ocr_elapsed_ms = round((time.perf_counter() - ocr_started_at) * 1000)
     previous_ocr_hash = str(_SUBPROC_SCAN_CACHE.get("ocr_hash", "") or "")
     if (
@@ -1432,6 +1413,7 @@ def run_scan_pipeline_subprocess(
     return {
         "ocr_ok": ocr_ok,
         "ocr_info": ocr_info,
+        "speaker_layout": speaker_layout,
         "mode": mode,
         "screen_context": screen_context,
         "ocr_text": str(pipeline.get("ocr_text", "")),
@@ -1809,6 +1791,7 @@ def main() -> int:
     from desktop_pet.llm.client import LLMClient
     from desktop_pet.llm.dialog_manager import DialogManager
     from desktop_pet.llm.semantic_attention import SemanticAttentionRouter
+    from desktop_pet.llm.reaction_classifier import LocalReactionClassifier, FILTER_MODELS, selected_filter_model
     from desktop_pet.llm.visual_novel import DedupCalibrator, VisualNovelStoryLibrary, VisualNovelTracker
     from desktop_pet.policy.comment_policy import can_emit_comment
     from desktop_pet.ui.chat_panel import ChatPanel
@@ -1885,6 +1868,16 @@ def main() -> int:
         cpu_threads=settings.semantic_attention_cpu_threads,
     )
     visual_novel_runtime = {"enabled": bool(settings.enable_visual_novel_mode)}
+    vn_filter_model = selected_filter_model(settings)
+
+    def _make_vn_classifier(model_id: str):
+        if model_id == "semantic":
+            return None
+        model_path = (base_dir / "assets" / "models" / "vn-reaction-fusion-r8"
+                      if model_id == "target-gru-fusion-r8" else Path(settings.vn_reaction_model_path))
+        return LocalReactionClassifier(model_path, settings.vn_reaction_cpu_threads)
+
+    vn_reaction_classifier = _make_vn_classifier(vn_filter_model)
     visual_novel_library = VisualNovelStoryLibrary(
         base_dir / "data" / "visual_novel_stories",
         legacy_path=base_dir / "data" / "visual_novel_story.json",
@@ -1980,7 +1973,7 @@ def main() -> int:
             return
         speech.speak(display_text)
 
-    def _speak_async_with_callback(display_text: str, on_start=None, on_error=None, is_valid=None) -> None:
+    def _speak_async_with_callback(display_text: str, on_start=None, on_error=None, is_valid=None, on_ready=None, on_end=None) -> None:
         if is_valid is not None and not is_valid():
             return
         if speech.is_muted():
@@ -1991,10 +1984,14 @@ def main() -> int:
             if callable(on_error):
                 on_error()
             return
-        if is_valid is None:
-            queued = speech.speak(display_text, on_start=on_start, on_error=on_error)
-        else:
-            queued = speech.speak(display_text, on_start=on_start, on_error=on_error, is_valid=is_valid)
+        callbacks = {"on_start": on_start, "on_error": on_error}
+        if is_valid is not None:
+            callbacks["is_valid"] = is_valid
+        if on_ready is not None:
+            callbacks["on_ready"] = on_ready
+        if on_end is not None:
+            callbacks["on_end"] = on_end
+        queued = speech.speak(display_text, **callbacks)
         if (not queued) and callable(on_error):
             on_error()
 
@@ -2010,27 +2007,63 @@ def main() -> int:
             callback()
 
     speech_ui = _SpeechUiBridge()
+    def _start_vn_reaction_warmup(classifier) -> None:
+        def _warmup_vn_reaction() -> None:
+            ready = classifier.warmup()
+            print(f"[VN] Reaction classifier: {classifier.status}", flush=True)
+            def deliver():
+                if classifier is vn_reaction_classifier:
+                    visual_novel_tracker.enable_local_reactions(ready)
+            speech_ui.ready.emit(deliver)
+        threading.Thread(target=_warmup_vn_reaction, daemon=True, name="vn-reaction-warmup").start()
+
+    if vn_reaction_classifier is not None:
+        _start_vn_reaction_warmup(vn_reaction_classifier)
 
     def show_and_speak(display_text: str, *, role: str | None = None, duration_ms: int | None = None, is_valid=None, on_display=None) -> None:
         bubble_ms = duration_ms if duration_ms is not None else estimate_bubble_duration_ms(display_text)
 
         shown_lock = threading.Lock()
-        shown_state = {"done": False, "started": False}
+        shown_state = {"done": False, "started": False, "sustained": False, "cancelled": False, "bubble_id": None}
         queued_at = time.perf_counter()
 
         def _emit_ui_once() -> None:
+            if shown_state["cancelled"]:
+                return
             if is_valid is not None and not shown_state["started"] and not is_valid():
                 return
             with shown_lock:
                 if shown_state["done"]:
                     return
                 shown_state["done"] = True
+            shown_state["bubble_id"] = pet.show_comment_bubble(display_text, duration_ms=0 if shown_state["sustained"] else bubble_ms)
             if role is not None:
                 chat.append_message(role, display_text)
-            pet.show_comment_bubble(display_text, duration_ms=bubble_ms)
             if on_display is not None:
                 on_display()
             print(f"[SPEECH-SYNC] displayed wait_ms={(time.perf_counter() - queued_at) * 1000:.1f}")
+
+        def _prepare_playback():
+            ready = threading.Event()
+            def display():
+                try:
+                    shown_state["sustained"] = True
+                    _emit_ui_once()
+                finally:
+                    ready.set()
+            speech_ui.ready.emit(display)
+            if not ready.wait(5):
+                shown_state["cancelled"] = True
+                return False
+            return shown_state["done"]
+
+        def _playback_ended():
+            print(f"[SPEECH-SYNC] playback_ended wait_ms={(time.perf_counter() - queued_at) * 1000:.1f}")
+            def hide():
+                if shown_state["sustained"] and shown_state["bubble_id"] is not None:
+                    pet.hide_comment_bubble(expected_generation=shown_state["bubble_id"])
+                    print(f"[SPEECH-SYNC] bubble_finished wait_ms={(time.perf_counter() - queued_at) * 1000:.1f}")
+            speech_ui.ready.emit(hide)
 
         def _ready(reason):
             if reason == "playback_started":
@@ -2042,11 +2075,11 @@ def main() -> int:
             _emit_ui_once()
             return
         args = (_speak_async_with_callback, display_text,
-                lambda: _ready("playback_started"), lambda: _ready("audio_unavailable"))
-        if is_valid is None:
-            tts_executor.submit(*args)
+                lambda: _ready("playback_started"), lambda: _ready("audio_unavailable"), is_valid)
+        if settings.tts_provider.lower() in {"gpt_sovits", "voicevox", "edge"}:
+            tts_executor.submit(*args, _prepare_playback, _playback_ended)
         else:
-            tts_executor.submit(*args, is_valid)
+            tts_executor.submit(*args)
 
     def speak_text(text: str) -> None:
         tts_executor.submit(_speak_async, text)
@@ -2313,7 +2346,6 @@ def main() -> int:
         # instead of calling QWidget.winId() off the GUI thread (see
         # _collect_pet_owned_hwnds).
         "pet_owned_hwnds": set(),
-        "plot_memory_synced_line": None,
         # Runtime overrides driven by the visual-novel side panel.
         "vision_capture_mode": str(settings.vision_capture_mode),
         "vision_change_threshold": float(settings.vision_change_threshold),
@@ -2631,44 +2663,45 @@ def main() -> int:
         # The scan is now only a fallback for an engine we did not launch: the
         # cached pid is validated on every call, so a restarted engine is still
         # noticed (its pid dies, the cache clears, and the scan runs at once).
-        try:
-            if voicevox_pid_cache <= 0:
-                launched_pid = int(getattr(speech, "voicevox_engine_pid", 0) or 0)
-                if launched_pid > 0:
-                    voicevox_pid_cache = launched_pid
-            if voicevox_pid_cache > 0:
-                try:
-                    proc = psutil.Process(int(voicevox_pid_cache))
-                    if proc.is_running() and str(proc.name()).lower() == "run.exe":
-                        _apply_proc_policy_cached(int(voicevox_pid_cache), normal_cls, [])
-                    else:
+        if settings.tts_provider.lower() == "voicevox":
+            try:
+                if voicevox_pid_cache <= 0:
+                    launched_pid = int(getattr(speech, "voicevox_engine_pid", 0) or 0)
+                    if launched_pid > 0:
+                        voicevox_pid_cache = launched_pid
+                if voicevox_pid_cache > 0:
+                    try:
+                        proc = psutil.Process(int(voicevox_pid_cache))
+                        if proc.is_running() and str(proc.name()).lower() == "run.exe":
+                            _apply_proc_policy_cached(int(voicevox_pid_cache), normal_cls, [])
+                        else:
+                            voicevox_pid_cache = 0
+                            # Rescan on this call rather than waiting out the interval.
+                            voicevox_policy_last_scan_ts = 0.0
+                    except Exception:
                         voicevox_pid_cache = 0
-                        # Rescan on this call rather than waiting out the interval.
                         voicevox_policy_last_scan_ts = 0.0
-                except Exception:
-                    voicevox_pid_cache = 0
-                    voicevox_policy_last_scan_ts = 0.0
 
-            need_full_scan = voicevox_pid_cache <= 0 and (
-                voicevox_policy_last_scan_ts <= 0.0
-                or (now_ts - voicevox_policy_last_scan_ts >= resource_policy_heavy_scan_interval_sec)
-            )
-            if need_full_scan:
-                voicevox_policy_last_scan_ts = now_ts
-                for proc in psutil.process_iter(attrs=["pid", "name", "exe", "cmdline"]):
-                    name = str((proc.info.get("name") or "")).lower()
-                    exe = str((proc.info.get("exe") or "")).lower()
-                    cmdline = " ".join(proc.info.get("cmdline") or []).lower()
-                    if name != "run.exe":
-                        continue
-                    if "voicevox" not in exe and "voicevox" not in cmdline and "vv-engine" not in exe and "vv-engine" not in cmdline:
-                        continue
-                    voicevox_pid_cache = int(proc.info.get("pid") or 0)
-                    if voicevox_pid_cache > 0:
-                        _apply_proc_policy_cached(voicevox_pid_cache, normal_cls, [])
-                        break
-        except Exception:
-            pass
+                need_full_scan = voicevox_pid_cache <= 0 and (
+                    voicevox_policy_last_scan_ts <= 0.0
+                    or (now_ts - voicevox_policy_last_scan_ts >= resource_policy_heavy_scan_interval_sec)
+                )
+                if need_full_scan:
+                    voicevox_policy_last_scan_ts = now_ts
+                    for proc in psutil.process_iter(attrs=["pid", "name", "exe", "cmdline"]):
+                        name = str((proc.info.get("name") or "")).lower()
+                        exe = str((proc.info.get("exe") or "")).lower()
+                        cmdline = " ".join(proc.info.get("cmdline") or []).lower()
+                        if name != "run.exe":
+                            continue
+                        if "voicevox" not in exe and "voicevox" not in cmdline and "vv-engine" not in exe and "vv-engine" not in cmdline:
+                            continue
+                        voicevox_pid_cache = int(proc.info.get("pid") or 0)
+                        if voicevox_pid_cache > 0:
+                            _apply_proc_policy_cached(voicevox_pid_cache, normal_cls, [])
+                            break
+            except Exception:
+                pass
 
         if resource_policy_last_mode != mode:
             log_heartbeat(
@@ -2752,7 +2785,7 @@ def main() -> int:
             "text_ratio": float(
                 state.get("visual_novel_text_ratio", settings.visual_novel_text_ratio)
             ),
-            "target_title": str(_persisted_regions.get("target_title") or state.get("last_capture_title") or ""),
+            "target_title": str(_persisted_regions.get("target_title") or settings.vision_target_title or state.get("last_capture_title") or ""),
         }
         try:
             scan_task_queue.put_nowait(payload)
@@ -3234,6 +3267,7 @@ def main() -> int:
             except Exception:
                 pass
 
+        speaker_layout = {}
         if vn_mode:
             ocr_result, filter_note = filter_visual_novel_ocr_result(
                 ocr_result,
@@ -3242,6 +3276,22 @@ def main() -> int:
             ocr_chars = int(ocr_result.char_count)
             if filter_note:
                 ocr_info = f"{ocr_info}+vn_filter({filter_note})"
+
+            if state.get("ocr_region") is None and state.get("vision_region") is None and not best_band:
+                from desktop_pet.vision.vn_speaker import correct_camus_speaker
+                ocr_result, name_note = correct_camus_speaker(
+                    ocr_result, _vision_image, title=str(getattr(window_rect, "title", "") or ""),
+                    process_name=str(getattr(window_rect, "process_name", "") or ""),
+                    text_ratio=float(state.get("visual_novel_text_ratio", settings.visual_novel_text_ratio)),
+                    bottom_margin=float(settings.vn_text_band_bottom_margin),
+                )
+                ocr_chars = int(ocr_result.char_count)
+                if name_note:
+                    ocr_info += "+" + name_note
+            if not best_band:
+                from desktop_pet.vision.speaker_layout import observe_speaker_layout
+                ocr_result, speaker_layout = observe_speaker_layout(
+                    ocr_result, image, _vision_image, window_rect, state)
 
         previous_ocr_hash = str(state.get("scan_cache_ocr_hash", "") or "")
 
@@ -3347,6 +3397,7 @@ def main() -> int:
         return {
             "ocr_ok": ocr_ok,
             "ocr_info": ocr_info,
+            "speaker_layout": speaker_layout,
             "mode": mode,
             "screen_context": screen_context,
             "ocr_text": str(pipeline.get("ocr_text", "")),
@@ -3383,7 +3434,7 @@ def main() -> int:
             return True
         return int(state.get("vision_budget_used", 0)) < int(settings.vision_budget_per_hour)
 
-    def _vision_worker(frame, source: str) -> str:
+    def _vision_worker(frame, source: str, ocr_context: str) -> dict:
         """Describe the frame the sampler captured.
 
         The frame is passed in rather than re-captured: a fresh screen grab reads
@@ -3393,8 +3444,7 @@ def main() -> int:
         from desktop_pet.vision.multimodal import describe_screen_image_compat
 
         if frame is None:
-            return ""
-        ocr_context = str(state.get("scan_cache_ocr_text", "") or "")
+            return {}
         result = describe_screen_image_compat(
             llm_client,
             frame,
@@ -3405,9 +3455,37 @@ def main() -> int:
             ocr_context=ocr_context[: int(settings.ocr_context_max_chars)],
             route="vision+ocr" if ocr_context else "vision_only",
             focus_query=str(settings.vision_focus_query),
-            content_kind="image",
+            content_kind="visual_novel",
         )
-        return str(result.summary or "").strip()
+        summary = str(result.summary or "").strip()
+        diagnostic = {"reason": getattr(result, "reason", "ok"),
+                      "elapsed_ms": getattr(result, "elapsed_ms", 0)}
+        if not summary:
+            return diagnostic
+        try:
+            parsed = json.loads(summary.removeprefix("```json").removeprefix("```").removesuffix("```").strip())
+        except (ValueError, TypeError):
+            # Unstructured output is usable only while the capture is current.
+            return {"appearance_environment": "", "moment": summary}
+        if not isinstance(parsed, dict):
+            return {**diagnostic, "reason": "invalid_schema"}
+        fields = {key: str(parsed.get(key) or "").strip()[:400]
+                  for key in ("appearance_environment", "moment")}
+        objects = parsed.get('objects', [])
+        if isinstance(objects, list):
+            descriptions = [f"对象{str(item.get('id', ''))[:12]}（{str(item.get('position', ''))[:30]}）：[type={item.get('type', 'unknown') if item.get('type') in {'human', 'animal', 'other'} else 'unknown'}]{str(item.get('appearance', ''))[:100]}"
+                            for item in objects[:6] if isinstance(item, dict)]
+            if descriptions:
+                fields['appearance_environment'] += '\n本次采样对象（编号不跨截图延续）：' + '；'.join(descriptions)
+            speaker_name = str(parsed.get('speaker_name') or '').strip()[:30]
+            speaker_object = str(parsed.get('speaker_object') or '').strip()[:12]
+            if speaker_name and speaker_object and any(
+                isinstance(item, dict) and str(item.get('id')) == speaker_object for item in objects[:6]
+            ):
+                fields['moment'] += f'\n本帧姓名栏识读「{speaker_name}」，旁侧头像外观对应对象{speaker_object}；仅为本帧说话人线索。'
+        if not any(fields.values()):
+            diagnostic["reason"] = "empty_observation" if any(key in parsed for key in fields) else "invalid_fields"
+        return {**diagnostic, **fields}
 
     def poll_vision_future() -> None:
         future = state.get("vision_future")
@@ -3424,18 +3502,38 @@ def main() -> int:
                     state["vision_future"] = None
                     state["vision_started_at"] = None
             return
+        captured_at = state.get("vision_started_at")
+        captured_dialogue = state.get("vision_request_dialogue", "")
+        captured_fingerprint = state.get("vision_request_fingerprint")
+        captured_token = state.get("vision_request_cache_token")
         state["vision_future"] = None
         state["vision_started_at"] = None
         try:
-            summary = str(future.result() or "").strip()
+            observation = future.result() or {}
+            if isinstance(observation, dict):
+                stable = str(observation.get("appearance_environment", "") or "").strip()
+                moment = str(observation.get("moment", "") or "").strip()
+                summary = stable + (f"\n采样瞬间的动作与表情：{moment}" if moment else "")
+                summary = summary.strip()
+            else:
+                stable, summary = "", str(observation).strip()
         except Exception as exc:
             log_heartbeat("vision_error", str(exc))
             return
         if not summary:
-            log_heartbeat("vision_empty")
+            reason = observation.get("reason", "empty") if isinstance(observation, dict) else "empty"
+            elapsed = observation.get("elapsed_ms", 0) if isinstance(observation, dict) else 0
+            log_heartbeat("vision_empty", f"reason={reason}, elapsed_ms={elapsed}")
+            return
+        if captured_token is not state.get("vn_cache_token"):
+            log_heartbeat("vision_discard", "cache_changed")
             return
         state["vision_context"] = summary[:600]
-        state["vision_context_at"] = datetime.now()
+        state["vision_context_at"] = captured_at
+        state["vision_context_dialogue"] = captured_dialogue
+        state["vision_context_fingerprint"] = captured_fingerprint
+        state['vision_context_full_fingerprint'] = state.get('vision_request_full_fingerprint')
+        state["vision_context_stable"] = stable
         log_heartbeat("vision_result", f"len={len(summary)}")
 
     def _grab_vision_frame():
@@ -3531,6 +3629,23 @@ def main() -> int:
                 return
 
             now = datetime.now()
+            if not state.get("scan_enabled") or not (
+                settings.enable_multimodal_vision and settings.enable_mm_screen_comment
+            ):
+                return
+            # Keep art freshness independent of the API quota and dialogue text.
+            _refresh_vision_exclusions()
+            frame = _grab_vision_frame()
+            if frame is None:
+                state["vision_current_fingerprint"] = None
+                state["vision_skip_reason"] = "no_frame"
+                return
+            fingerprint = _vn_visual_fingerprint(
+                frame, float(state.get("visual_novel_text_ratio", settings.visual_novel_text_ratio))
+            )
+            state["vision_current_fingerprint"] = fingerprint
+            state['vision_current_full_fingerprint'] = _frame_fingerprint(frame)
+            state["vision_current_frame_at"] = now
             tokens, refill_at = _vision_quota_state(now)
             state["vision_tokens"] = tokens
             state["vision_tokens_at"] = refill_at
@@ -3558,13 +3673,6 @@ def main() -> int:
                 state["vision_skip_reason"] = reason
                 return
 
-            _refresh_vision_exclusions()
-            frame = _grab_vision_frame()
-            if frame is None:
-                state["vision_skip_reason"] = "no_frame"
-                return
-
-            fingerprint = _frame_fingerprint(frame)
             cached = state.get("vision_sampler_fingerprint")
             delta = 1.0
             if isinstance(cached, (bytes, bytearray)):
@@ -3591,9 +3699,14 @@ def main() -> int:
 
             # Consume quota only on a real submission.
             state["vision_tokens"] = max(0.0, tokens - 1.0)
+            captured_dialogue = str(state.get("scan_cache_ocr_text", "") or "")
+            state["vision_request_fingerprint"] = fingerprint
+            state['vision_request_full_fingerprint'] = state['vision_current_full_fingerprint']
+            state["vision_request_cache_token"] = state.get("vn_cache_token")
             state["vision_future"] = vision_executor.submit(
-                _vision_worker, frame, str(state.get("last_capture_source", "") or "")
+                _vision_worker, frame, str(state.get("last_capture_source", "") or ""), captured_dialogue
             )
+            state["vision_request_dialogue"] = captured_dialogue
             state["vision_started_at"] = now
             state["vision_last_request_at"] = now
             state["vision_budget_used"] = int(state.get("vision_budget_used", 0)) + 1
@@ -3617,13 +3730,38 @@ def main() -> int:
         summary = str(state.get("vision_context", "") or "").strip()
         if not summary:
             return ""
+        stable = str(state.get("vision_context_stable", "") or "").strip()
+        old_context = ("较早画面观察，仅供此前外观与环境参考，不代表当前事件：" + stable) if stable else ""
+        previous_frame = state.get("vision_context_fingerprint")
+        current_frame = state.get("vision_current_fingerprint")
+        frame_at = state.get("vision_current_frame_at")
+        art_matches = bool(previous_frame and current_frame and isinstance(frame_at, datetime)
+                           and (datetime.now() - frame_at).total_seconds() <= 3.0
+                           and _fingerprint_diff_ratio(previous_frame, current_frame) < 0.03)
+        previous_full = state.get('vision_context_full_fingerprint')
+        current_full = state.get('vision_current_full_fingerprint')
+        art_matches = bool(art_matches and previous_full and current_full
+                           and _fingerprint_diff_ratio(previous_full, current_full) < 0.03)
         captured_at = state.get("vision_context_at")
         if isinstance(captured_at, datetime):
             age = (datetime.now() - captured_at).total_seconds()
             # Stale observations would describe a scene the player has left, and
             # a cutscene changes faster than a dialogue box does.
             if age > float(settings.vision_context_ttl_sec):
+                if art_matches and stable:
+                    return "持续外观参考（当前画面主体仍相近，只复用外观，不沿用旧动作和表情；人物归属须结合当前对白）：" + stable
                 return ""
+        if str(state.get("vision_context_dialogue", "")) != str(state.get("scan_cache_ocr_text", "") or ""):
+            previous_frame = state.get("vision_context_fingerprint")
+            current_frame = state.get("vision_current_fingerprint")
+            frame_at = state.get("vision_current_frame_at")
+            if art_matches:
+                return "持续外观参考（当前画面主体仍相近，只复用外观，不沿用旧动作和表情；人物归属须结合当前对白）：" + stable if stable else old_context
+            return old_context
+        previous_frame = state.get("vision_context_fingerprint")
+        current_frame = state.get("vision_current_fingerprint")
+        if previous_frame and current_frame and _fingerprint_diff_ratio(previous_frame, current_frame) >= 0.03:
+            return old_context
         return summary
 
     def _check_game_window_change() -> bool:
@@ -3693,7 +3831,6 @@ def main() -> int:
     def _process_visual_novel_text(result: dict, now: datetime) -> None:
         if visual_novel_tracker is None:
             return
-        poll_vision_future()
         state["last_capture_source"] = str(result.get("capture_source", "") or "")
         state["last_capture_title"] = str(result.get("capture_title", "") or "")
         if window_resolver is not None and state["last_capture_title"]:
@@ -3762,7 +3899,8 @@ def main() -> int:
             return
 
         last_evaluation_at = state.get("vn_last_evaluation_at")
-        if isinstance(last_evaluation_at, datetime) and (now - last_evaluation_at).total_seconds() < 12.0:
+        remote_evaluation_due = not isinstance(last_evaluation_at, datetime) or (now - last_evaluation_at).total_seconds() >= 12.0
+        if not visual_novel_tracker._local_reaction_enabled and not remote_evaluation_due:
             log_heartbeat("vn_wait", "evaluation_rate_limit")
             return
 
@@ -3772,21 +3910,23 @@ def main() -> int:
         # triggered them, so the reply described content the player had left.
         cooldown_sec = max(8.0, float(settings.auto_comment_cooldown_sec) * 0.33)
         allow_comment = can_emit_comment(state["last_comment_at"], int(cooldown_sec))
-        payload = visual_novel_tracker.build_evaluation_payload()
-        if payload is None:
+        reserved = visual_novel_tracker.reserve_evaluation_snapshot()
+        if reserved is None:
             return
-        payload["personalization_hint"] = dialog.build_personalization_hint()
+        snapshot, reason = reserved
+        personalization_hint = dialog.build_personalization_hint()
         visual_context = _current_visual_context()
-        if visual_context:
-            payload["visual_context"] = visual_context
-        state["vn_last_evaluation_at"] = now
+        if not snapshot._local_reaction_enabled:
+            state["vn_last_evaluation_at"] = now
         meta = {
             "kind": "visual_novel", "now": now, "allow_comment": allow_comment,
-            "reason": str(payload.get("reason", "")),
-            "summary_len": len(str(payload.get("scene_summary", ""))),
+            "reason": reason,
+            "summary_len": len(snapshot.scene_summary),
             "visual_used": bool(visual_context),
             "story_path": str(visual_novel_tracker.path),
             "submitted_at": time.monotonic(),
+            "submitted_line_count": snapshot.total_lines,
+            "cache_token": state.get("vn_cache_token"),
         }
         state["pending_comment_meta"] = meta
         def on_reaction(evaluation):
@@ -3794,52 +3934,70 @@ def main() -> int:
                 if state.get("pending_comment_meta") is not meta:
                     return
                 log_heartbeat("vn_reaction_ready", f"elapsed_ms={round((time.monotonic() - meta['submitted_at']) * 1000)}")
+                meta["reaction_ready_ms"] = round((time.monotonic() - meta["submitted_at"]) * 1000)
+                if type(evaluation.get("reaction_line_id")) is int:
+                    meta["reaction_line_id"] = evaluation["reaction_line_id"]
                 _publish_comment(evaluation.get("comment", ""), meta)
             speech_ui.ready.emit(deliver)
-        state["comment_future"] = comment_executor.submit(
-            comment_engine.evaluate_visual_novel, payload, on_reaction,
-        )
+        snapshot._reaction_classifier = vn_reaction_classifier
+        def evaluate_snapshot():
+            started = time.monotonic()
+            if state.get("pending_comment_meta") is not meta:
+                return {}
+            local_decision = None
+            classifier = getattr(snapshot, "_reaction_classifier", vn_reaction_classifier)
+            if classifier is not None and snapshot._local_reaction_enabled:
+                rows = (snapshot._fusion_classifier_lines
+                        if getattr(classifier, "model_id", "") == "target-gru-fusion-r8"
+                        else snapshot._classifier_lines)
+                local_decision = classifier.classify(rows)
+                if local_decision is None:
+                    def disable_failed_classifier():
+                        if classifier is vn_reaction_classifier:
+                            visual_novel_tracker.enable_local_reactions(False)
+                    speech_ui.ready.emit(disable_failed_classifier)
+                    log_heartbeat("vn_local_fallback", classifier.status)
+                    if not remote_evaluation_due:
+                        return {"local_filter_deferred": True}
+                else:
+                    log_heartbeat(
+                        "vn_local_class",
+                        f"class={local_decision['class']}, model={local_decision['model']}, "
+                        f"elapsed_ms={round((time.monotonic() - started) * 1000)}",
+                    )
+                    summary_due = snapshot.total_lines - snapshot._summarized_line_count >= snapshot._summary_batch_size
+                    if local_decision["class"] == 0 and not summary_due:
+                        return {"local_filter_skipped": True}
+                    if not remote_evaluation_due:
+                        return {"local_filter_deferred": True}
+            payload = snapshot.build_evaluation_payload()
+            if state.get("pending_comment_meta") is not meta:
+                return {}
+            if local_decision is not None:
+                payload["local_reaction_class"] = local_decision["class"]
+                payload["local_reaction_binary"] = bool(local_decision.get("binary"))
+            payload["personalization_hint"] = personalization_hint
+            latest_visual_context = _current_visual_context()
+            if latest_visual_context:
+                payload["visual_context"] = latest_visual_context
+                payload['characters'] = snapshot._select_characters_for_context(
+                    payload.get('new_dialogue') or payload['recent_dialogue'], visual_context=latest_visual_context)
+            log_heartbeat("vn_selection_ready", f"elapsed_ms={round((time.monotonic() - started) * 1000)}, visual={int(bool(latest_visual_context))}")
+            if snapshot._local_reaction_enabled:
+                state["vn_last_evaluation_at"] = datetime.now()
+            log_heartbeat("vn_remote_evaluate", f"local_class={payload.get('local_reaction_class', 'legacy')}")
+            result = comment_engine.evaluate_visual_novel(payload, on_reaction)
+            if result:
+                result["evidence_line_ids"] = list(payload["evidence_line_ids"])
+                result['visual_evidence'] = latest_visual_context
+                result['require_evidence'] = True
+            return result
+        state["comment_future"] = comment_executor.submit(evaluate_snapshot)
         log_heartbeat(
             "vn_evaluate",
-            f"reason={payload.get('reason', 'unknown')}, visual={int(bool(visual_context))}, "
+            f"reason={reason}, visual={int(bool(visual_context))}, "
             f"cooldown_ok={int(allow_comment)}",
         )
-
-    def _sync_plot_memory(evaluation: dict) -> None:
-        """Mirror newly learned plot facts into the long-term memory store.
-
-        The story cache remains the fast working set; this makes plot knowledge
-        reachable from the ordinary chat path, which only ranks SQLite rows.
-        Only newly merged facts are forwarded so the store does not fill up with
-        the paraphrased duplicates the tracker already collapsed.
-        """
-        if visual_novel_tracker is None:
-            return
-        added = evaluation.get("added_facts")
-        new_facts = [str(item) for item in added if str(item).strip()] if isinstance(added, list) else []
-        last_sync = state.get("plot_memory_synced_line")
-        total_lines = visual_novel_tracker.total_lines
-        due = (
-            not isinstance(last_sync, int)
-            or (total_lines - last_sync) >= 24
-            or len(new_facts) >= 3
-        )
-        if not due and str(evaluation.get("moment_type", "")) not in {"twist", "choice", "tender"}:
-            return
-        digest = visual_novel_tracker.scene_session_digest(max_chars=420)
-        if not digest and not new_facts:
-            return
-        try:
-            dialog.append_plot_memory(
-                story_title=visual_novel_tracker.story_title,
-                digest=digest,
-                facts=new_facts[:4],
-                confidence=0.68,
-            )
-            state["plot_memory_synced_line"] = total_lines
-            log_heartbeat("vn_memory_sync", f"facts={len(new_facts[:4])}, line={total_lines}")
-        except Exception as exc:
-            log_heartbeat("vn_memory_sync_error", str(exc))
 
     def _retry_visual_novel_evaluation(reason: str) -> None:
         if visual_novel_tracker is not None:
@@ -3856,8 +4014,10 @@ def main() -> int:
             if meta.get("reaction_emitted"):
                 return False
             is_valid = lambda: (state.get("visual_novel_mode_enabled", True)
+                                and state.get("vn_cache_token") is meta.get("cache_token")
                                 and str(visual_novel_tracker.path) == meta.get("story_path")
-                                and time.monotonic() - meta["submitted_at"] <= 20.0)
+                                and time.monotonic() - meta["submitted_at"] <= 20.0
+                                and 0 <= visual_novel_tracker.total_lines - meta.get("reaction_line_id", meta["submitted_line_count"]) < 10)
             if not is_valid():
                 log_heartbeat("vn_skip", "comment_expired_memory_preserved")
                 return False
@@ -3878,13 +4038,23 @@ def main() -> int:
             )
             return
 
-        state["last_comment_at"] = datetime.now() if meta.get("kind") == "visual_novel" else meta.get("now", datetime.now())
-        state["last_summary"] = meta.get("cycle_signature", "")
-        state["last_comment_text"] = comment
+        if meta.get("kind") != "visual_novel":
+            state["last_comment_at"] = meta.get("now", datetime.now())
+            state["last_summary"] = meta.get("cycle_signature", "")
+            state["last_comment_text"] = comment
         on_display = None
         if meta.get("kind") == "visual_novel" and visual_novel_tracker is not None:
             def on_display():
-                visual_novel_tracker.remember_comment(comment)
+                state["last_comment_at"] = datetime.now()
+                state["last_summary"] = meta.get("cycle_signature", "")
+                state["last_comment_text"] = comment
+                displayed_ms = round((time.monotonic() - meta["submitted_at"]) * 1000)
+                visual_novel_tracker.remember_comment(comment, evidence={
+                    "reaction_line_id": meta.get("reaction_line_id"),
+                    "submitted_line_count": meta["submitted_line_count"],
+                    "request_to_display_ms": displayed_ms,
+                    "reaction_ready_ms": meta.get("reaction_ready_ms"),
+                })
                 log_heartbeat("vn_comment_displayed", f"request_to_display_ms={round((time.monotonic() - meta['submitted_at']) * 1000)}")
         role = "桌宠(视觉小说)" if meta.get("kind") == "visual_novel" else "桌宠(自动)"
         _emit_comment(comment, role=role, is_valid=is_valid, on_display=on_display)
@@ -3918,6 +4088,13 @@ def main() -> int:
 
         if meta.get("kind") == "visual_novel":
             evaluation = generated if isinstance(generated, dict) else {}
+            if evaluation.get("local_filter_skipped"):
+                log_heartbeat("vn_skip", "local_classifier_silence")
+                return
+            if evaluation.get("local_filter_deferred"):
+                visual_novel_tracker.restore_evaluation_cursor()
+                log_heartbeat("vn_wait", "local_candidate_remote_rate_limit")
+                return
             if visual_novel_tracker is not None:
                 if not evaluation:
                     _retry_visual_novel_evaluation(comment_engine.last_visual_novel_error or "empty_evaluation")
@@ -3925,7 +4102,6 @@ def main() -> int:
                 state["vn_eval_failure_streak"] = 0
                 state["vn_eval_retry_after"] = None
                 visual_novel_tracker.apply_evaluation(evaluation)
-                _sync_plot_memory(evaluation)
             if not bool(evaluation.get("should_comment", False)):
                 log_heartbeat(
                     "vn_skip",
@@ -3934,6 +4110,8 @@ def main() -> int:
                     f"reaction_repeats={int(bool(evaluation.get('reaction_repeats', False)))}",
                 )
                 return
+            if type(evaluation.get("reaction_line_id")) is int:
+                meta["reaction_line_id"] = evaluation["reaction_line_id"]
             comment = str(evaluation.get("comment", "")).strip()
         else:
             comment = generated
@@ -4080,7 +4258,10 @@ def main() -> int:
                 duration_sec = max(float(duration_sec), float(result_msg.get("duration_sec", 0.0)))
             else:
                 result = future.result()
+            if "speaker_layout" in result:
+                state["speaker_layout"] = result["speaker_layout"]
             if state["visual_novel_mode_enabled"] and result.get("capture_source") == "target_missing":
+                state["speaker_layout"] = {}
                 on_scan_toggle(False, announce=False)
                 log_heartbeat("vn_target_missing", "scan_paused")
                 chat.append_message("系统", "已锁定的游戏窗口不可用，视觉小说扫描已暂停。重新打开游戏后可再开启扫描。")
@@ -4113,6 +4294,10 @@ def main() -> int:
             state["scan_cache_ocr_confidence"] = float(
                 result.get("ocr_confidence", 0.0) or 0.0
             )
+            if state["visual_novel_mode_enabled"]:
+                sidebar = getattr(pet, "vn_sidebar", None)
+                if sidebar is not None:
+                    _refresh_ocr_status(sidebar)
 
             mode = result["mode"]
             screen_context = result["screen_context"]
@@ -4365,11 +4550,21 @@ def main() -> int:
         sidebar = getattr(pet, "vn_sidebar", None)
         if sidebar is None:
             return
+        if vn_reaction_classifier is None:
+            model_status = "已启用原始语义筛选"
+        elif vn_reaction_classifier.status.startswith("ready:"):
+            model_status = "本地模型已就绪"
+        elif vn_reaction_classifier.status.startswith("unavailable:"):
+            model_status = "模型加载失败，暂用语义筛选\n" + vn_reaction_classifier.status
+        else:
+            model_status = "正在加载本地模型，暂用语义筛选"
+        sidebar.set_filter_status(vn_filter_model, model_status)
         try:
             sidebar.set_story_name(_loaded_story_name())
         except Exception:
             pass
         _refresh_ocr_status(sidebar)
+        sidebar.set_speaker_layout(state.get("speaker_layout", {}))
         if visual_novel_tracker is None:
             return
         sidebar.set_memory_status(
@@ -4499,6 +4694,27 @@ def main() -> int:
         _invalidate_scan_cache()
         refresh_vn_sidebar_state()
 
+    def on_vn_filter_model_changed(model_id: str) -> None:
+        nonlocal vn_filter_model, vn_reaction_classifier
+        if model_id not in FILTER_MODELS or model_id == vn_filter_model:
+            return
+        from dotenv import set_key
+        try:
+            set_key(str(base_dir / ".env"), "VN_REACTION_FILTER_MODEL", model_id)
+        except OSError as exc:
+            chat.append_message("系统", f"模型选择未能保存：{exc}")
+            refresh_vn_sidebar_state()
+            return
+        _discard_pending_vn_evaluation()
+        visual_novel_tracker.enable_local_reactions(False)
+        vn_filter_model = model_id
+        vn_reaction_classifier = _make_vn_classifier(model_id)
+        if vn_reaction_classifier is not None:
+            _start_vn_reaction_warmup(vn_reaction_classifier)
+        state["vn_last_evaluation_at"] = None
+        refresh_vn_sidebar_state()
+        chat.append_message("系统", f"评论筛选已切换：{FILTER_MODELS[model_id]}")
+
     def on_vn_vision_quota_changed(value: int) -> None:
         """Vision shots per minute; the sampler's token refill rate."""
         state["vision_shots_per_minute"] = max(1, min(60, int(value)))
@@ -4573,6 +4789,9 @@ def main() -> int:
         refresh_vn_sidebar_state()
 
     def _discard_pending_vn_evaluation() -> None:
+        state["vn_cache_token"] = object()
+        state["vision_context"] = ""
+        state["vision_context_fingerprint"] = None
         pending_meta = state.get("pending_comment_meta")
         if not isinstance(pending_meta, dict) or pending_meta.get("kind") != "visual_novel":
             return
@@ -5006,6 +5225,52 @@ def main() -> int:
             refresh_vn_sidebar_state()
 
         _prompt_region_selection(hint="拖拽框住游戏对话框，右键或Esc取消", on_selected=_apply)
+
+    def on_confirm_speaker_layout() -> None:
+        import base64
+        from PyQt6.QtGui import QPixmap
+        from PyQt6.QtWidgets import QDialog, QDialogButtonBox, QLabel, QVBoxLayout
+        from desktop_pet.vision.speaker_layout import save_profile
+
+        details = dict(state.get('speaker_layout', {}))
+        if details.get('status') != 'candidate':
+            return
+        dialog = QDialog(pet)
+        dialog.setWindowTitle('确认姓名栏')
+        layout = QVBoxLayout(dialog)
+        label = QLabel(f"{details['title']}\n红框是否是说话人的姓名？确认后会记住位置，不改写角色名。", dialog)
+        label.setWordWrap(True)
+        layout.addWidget(label)
+        preview = QLabel(dialog)
+        pixmap = QPixmap()
+        pixmap.loadFromData(base64.b64decode(details['preview']))
+        preview.setPixmap(pixmap)
+        layout.addWidget(preview)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel, dialog)
+        buttons.button(QDialogButtonBox.StandardButton.Save).setText('确认并保存')
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        if state.get('speaker_layout', {}).get('key') != details['key']:
+            return
+        save_profile(details)
+        state['speaker_layout'] = {**details, 'status': 'confirmed', 'speaker': ''}
+        _invalidate_scan_cache()
+        refresh_vn_sidebar_state()
+
+    def on_reset_speaker_layout() -> None:
+        from desktop_pet.vision.speaker_layout import save_profile
+        details = state.get('speaker_layout', {})
+        if details.get('key'):
+            save_profile(details, remove=True)
+        state.pop('speaker_layout_learner', None)
+        state['speaker_layout'] = {}
+        _invalidate_scan_cache()
+        if settings.enable_scan_subprocess and state['scan_enabled']:
+            _reset_scan_worker('speaker_layout_reset')
+        refresh_vn_sidebar_state()
 
     def on_vn_reset_ocr_region() -> None:
         _persisted_regions.pop("ocr_region", None)
@@ -5767,6 +6032,7 @@ def main() -> int:
     vn_sidebar = getattr(pet, "vn_sidebar", None)
     if vn_sidebar is not None:
         vn_sidebar.capture_mode_changed.connect(on_vn_capture_mode_changed)
+        vn_sidebar.filter_model_changed.connect(on_vn_filter_model_changed)
         vn_sidebar.vision_quota_changed.connect(on_vn_vision_quota_changed)
         vn_sidebar.vision_change_threshold_changed.connect(on_vn_change_threshold_changed)
         vn_sidebar.text_ratio_changed.connect(on_vn_text_ratio_changed)
@@ -5777,6 +6043,8 @@ def main() -> int:
         vn_sidebar.reset_vision_region_requested.connect(on_vn_reset_vision_region)
         vn_sidebar.select_ocr_region_requested.connect(on_vn_select_ocr_region)
         vn_sidebar.reset_ocr_region_requested.connect(on_vn_reset_ocr_region)
+        vn_sidebar.confirm_speaker_layout_requested.connect(on_confirm_speaker_layout)
+        vn_sidebar.reset_speaker_layout_requested.connect(on_reset_speaker_layout)
         vn_sidebar.probe_ocr_requested.connect(on_vn_probe_ocr)
         vn_sidebar.select_story_requested.connect(on_visual_novel_story_manager_requested)
         vn_sidebar.add_memory_requested.connect(on_vn_add_memory)
@@ -5822,7 +6090,7 @@ def main() -> int:
         QTimer.singleShot(500, _try_sync_live2d_py_windows)
 
     vn_sidebar_status_timer = QTimer()
-    vn_sidebar_status_timer.setInterval(2500)
+    vn_sidebar_status_timer.setInterval(500)
     vn_sidebar_status_timer.timeout.connect(refresh_vn_sidebar_state)
     if vn_sidebar is not None:
         vn_sidebar_status_timer.start()
@@ -5837,16 +6105,7 @@ def main() -> int:
         while not vision_sampler_stop.is_set():
             poll_vision_future()
             vision_sampling_step()
-            # While the minimum-gap floor is the binding constraint there is
-            # nothing to do for that whole window, so sleep it out instead of
-            # ticking every second.
-            wait = 1.0
-            now = datetime.now()
-            since_last = _vision_since_last_sec(now)
-            min_gap = float(state.get("vision_min_gap_sec", settings.vision_min_gap_sec))
-            if since_last is not None and min_gap > 0 and since_last < min_gap:
-                wait = max(0.2, (min_gap - since_last) + 0.05)
-            vision_sampler_stop.wait(min(wait, 30.0))
+            vision_sampler_stop.wait(1.0)
 
     vision_sampler_thread = threading.Thread(
         target=_vision_sampler_loop,

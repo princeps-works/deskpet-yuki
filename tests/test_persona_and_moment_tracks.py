@@ -390,7 +390,8 @@ def test_visual_novel_comment_uses_a_grounded_personal_reaction():
     result = CommentEngine(client).evaluate_visual_novel(
         {"reason": "semantic_candidate", "recent_dialogue": "那封信，是我留下的。"}
     )
-    assert "先分清本段确实发生了什么" in client.prompt
+    assert "reaction_basis只引用" in client.prompt
+    assert "剧情理解和人物分析放入scene_delta" in client.prompt
     assert result["reaction_basis"] == "被怀疑的人承认留下了信"
     assert result["felt_reaction"] == "意外，也担心之前误会了他"
     assert result["should_comment"] is True
@@ -400,3 +401,35 @@ def test_persona_anchor_lookup_is_cached_and_safe():
     source = _segment("_persona_moment_anchors")
     assert "_PERSONA_ANCHORS_CACHE" in source
     assert "except Exception" in source, "a broken persona file must not raise"
+
+
+def test_automatic_vn_request_separates_game_speakers_from_real_user():
+    from desktop_pet.llm.comment_engine import CommentEngine
+    class Client:
+        def chat(self, user_text, system_prompt, **kwargs):
+            self.user_text, self.system_prompt = user_text, system_prompt
+            return '{"should_comment": false}'
+    client = Client()
+    dialogue = '【肇】「究竟是谁允许他们看本少爷的女人的」'
+    CommentEngine(client).evaluate_visual_novel({'new_dialogue':dialogue,'recent_dialogue':dialogue})
+    assert '本次没有用户发言' in client.user_text
+    assert '现实用户不是游戏主角' in client.system_prompt
+    assert dialogue in client.user_text
+
+
+def test_micro_reaction_keeps_short_text_and_persona_boundary():
+    from desktop_pet.llm.comment_engine import CommentEngine
+    class Client:
+        def chat(self, user_text, system_prompt, **kwargs):
+            self.user_text, self.system_prompt = user_text, system_prompt
+            return json.dumps({'should_comment':True,'moment_type':'humor',
+                               'reaction_repeats':False,'felt_reaction':'噗。','comment':'噗。'})
+    client = Client()
+    result = CommentEngine(client).evaluate_visual_novel({
+        'new_dialogue':'暂且先雇个三星级餐厅的主厨吧。',
+        'recent_dialogue':'暂且先雇个三星级餐厅的主厨吧。'})
+    assert result['should_comment'] and result['comment'] == '噗。'
+    assert '细小笑点、反差或触动' in client.user_text
+    assert '用词、称呼和语气服从人设' in client.user_text
+    assert '只有明显的笑点' not in client.user_text
+    assert '现实用户不是游戏主角' in client.system_prompt

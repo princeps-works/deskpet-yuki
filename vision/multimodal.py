@@ -80,14 +80,32 @@ def describe_screen_image_compat(
                 "优先包含：页面类型、主要区域、非文字视觉内容、界面状态和用户可能进行的操作。"
                 "只保留评论所需的关键信息，不要逐字抄写整张屏幕。"
             )
+    if str(content_kind or "").strip().lower() == "visual_novel":
+        prompt = (
+            "请描述这张视觉小说截图，只输出JSON对象，不要Markdown，总计不超过320字。"
+            '格式：{"appearance_environment":"人物可见外观、人数、背景场景、CG或立绘类型",'
+            '"moment":"此刻可见的动作与表情；没有则留空",'
+            '"speaker_name":"姓名栏清晰可读时逐字抄写，否则空","speaker_object":"姓名栏旁头像与某对象外观明显相同时填对象id，否则空",'
+            '"objects":[{"id":"A","type":"human/animal/other/unknown","position":"左侧/右侧等位置","appearance":"该对象可见外观"}]}。'
+            "人物和动物分别列入objects，最多6个；id只在本次截图有效，不填写推测的角色姓名。"
+            "对白头像可能是同一立绘的重复显示，明显相同时不重复计为新人物，不确定就注明。"
+            "说话人只能根据姓名栏与头像对应，不根据嘴型或台词提到的人名猜测；姓名识别与OCR不同也如实抄写供比较。"
+            "appearance_environment不要包含表情、动作、台词、心理推测或剧情判断。"
+            "moment只描述可见表现，不推断心理、动机或具体人物身份。"
+            "不记录存档、读取等游戏按钮，不重抄台词；场景只按可见背景判断，不根据台词猜地点。"
+            f"\n本地OCR仅用于区分对白与界面：\n{compact_ocr}"
+        )
     prepared = _resize_image_for_vision(image, max_edge=max_edge)
     started = time.perf_counter()
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vision-compat")
+    vision_model = str(getattr(getattr(llm_client, "settings", None), "vision_model_name", ""))
+    request_options = {"disable_thinking": True} if content_kind == "visual_novel" and vision_model.lower().startswith("deepseek") else {}
     future = executor.submit(
         llm_client.describe_image,
         prepared,
         prompt,
         SYSTEM_VISION_PROMPT,
+        **request_options,
     )
 
     try:
@@ -100,10 +118,12 @@ def describe_screen_image_compat(
         executor.shutdown(wait=False, cancel_futures=True)
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         return VisionCompatResult(summary="", reason="timeout", elapsed_ms=elapsed_ms)
-    except Exception:
+    except Exception as exc:
         executor.shutdown(wait=False, cancel_futures=True)
         elapsed_ms = int((time.perf_counter() - started) * 1000)
-        return VisionCompatResult(summary="", reason="error", elapsed_ms=elapsed_ms)
+        status = getattr(exc, "status_code", None)
+        reason = f"error:{type(exc).__name__}" + (f":status={status}" if isinstance(status, int) else "")
+        return VisionCompatResult(summary="", reason=reason, elapsed_ms=elapsed_ms)
     else:
         executor.shutdown(wait=False)
 

@@ -29,6 +29,7 @@ def test_comment_waits_for_playback_and_displays_once_on_gui_thread():
               threading=threading, time=time)
     bridge = _load("_SpeechUiBridge", ns)()
     ns.update(speech_ui=bridge, speech=SimpleNamespace(is_muted=lambda: False, get_status=lambda: (True, "ok")),
+              settings=SimpleNamespace(tts_provider="gpt_sovits"),
               estimate_bubble_duration_ms=lambda _: 3000,
               chat=SimpleNamespace(append_message=lambda *a: calls.append(("chat", threading.get_ident()))),
               pet=SimpleNamespace(show_comment_bubble=lambda *a, **k: calls.append(("bubble", threading.get_ident()))),
@@ -43,7 +44,7 @@ def test_comment_waits_for_playback_and_displays_once_on_gui_thread():
     worker.join()
     assert calls == []
     _APP.processEvents()
-    assert calls == [("chat", threading.get_ident()), ("bubble", threading.get_ident())]
+    assert calls == [("bubble", threading.get_ident()), ("chat", threading.get_ident())]
     for muted, available in ((True, True), (False, False)):
         calls.clear()
         tasks.clear()
@@ -51,6 +52,83 @@ def test_comment_waits_for_playback_and_displays_once_on_gui_thread():
         show("纯文字", role="桌宠")
         assert len(calls) == 2
         assert tasks == []  # Do not wait behind translation warmup when audio is off.
+
+
+def test_ui_readiness_precedes_audio_and_end_closes_only_owned_bubble():
+    import time
+    calls = []
+    tasks = []
+    ns = dict(QObject=QObject, Qt=Qt, pyqtSignal=pyqtSignal, pyqtSlot=pyqtSlot,
+              threading=threading, time=time)
+    bridge = _load("_SpeechUiBridge", ns)()
+    def bubble(text, duration_ms):
+        calls.append(("shown", duration_ms))
+        return 7
+    ns.update(speech_ui=bridge, speech=SimpleNamespace(is_muted=lambda: False, get_status=lambda: (True, "ok")),
+              settings=SimpleNamespace(tts_provider="gpt_sovits"),
+              estimate_bubble_duration_ms=lambda _: 3000,
+              chat=SimpleNamespace(append_message=lambda *args: None),
+              pet=SimpleNamespace(show_comment_bubble=bubble,
+                                  hide_comment_bubble=lambda **kwargs: calls.append(("hidden", kwargs["expected_generation"]))),
+              tts_executor=SimpleNamespace(submit=lambda *args: tasks.append(args)),
+              _speak_async_with_callback=lambda *args: None)
+    _load("show_and_speak", ns)("长语音")
+    def playback():
+        assert tasks[0][5]() is True
+        calls.append(("audio", None))
+        tasks[0][2]()
+        tasks[0][6]()
+    thread = threading.Thread(target=playback)
+    thread.start()
+    deadline = time.monotonic() + 3
+    while thread.is_alive() and time.monotonic() < deadline:
+        _APP.processEvents()
+        time.sleep(.001)
+    thread.join(1)
+    _APP.processEvents()
+    assert not thread.is_alive()
+    assert calls == [("shown", 0), ("audio", None), ("hidden", 7)]
+
+
+def test_speech_end_callback_runs_after_all_segments_and_on_cancellation():
+    for cancel in (False, True):
+        calls = []
+        service = SpeechService.__new__(SpeechService)
+        service._generation = service._active_generation = 0
+        service._muted = False
+        service._diag = False
+        service._queue = queue.Queue()
+        service._translation_service = None
+        service._provider = "gpt_sovits"
+        def speak(*args):
+            calls.extend(["first_segment", "last_segment"])
+            if cancel:
+                service._generation += 1
+        service._speak_once = speak
+        service._queue.put(_SpeechTask("测试", on_end=lambda: calls.append("ended")))
+        service._queue.put(None)
+        service._run_worker()
+        assert calls == ["first_segment", "last_segment", "ended"]
+
+
+def test_bubble_end_does_not_hide_a_replacement_and_speech_has_no_timer():
+    tree = ast.parse((Path(__file__).resolve().parents[1] / "ui/pet_window.py").read_text(encoding="utf-8"))
+    namespace = {}
+    for name in ("show_comment_bubble", "hide_comment_bubble"):
+        node = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == name)
+        exec(compile(ast.Module(body=[node], type_ignores=[]), "pet_window.py", "exec"), namespace)
+    calls = []
+    pet = SimpleNamespace(bubble=SimpleNamespace(say=lambda _: None, adjustSize=lambda: None,
+                                                hide=lambda: calls.append("hide"), repaint=lambda: None),
+                          _update_bubble_pos=lambda: None,
+                          _bubble_hide_timer=SimpleNamespace(start=lambda n: calls.append(n), stop=lambda: None))
+    first = namespace["show_comment_bubble"](pet, "语音", 0)
+    assert calls == []
+    second = namespace["show_comment_bubble"](pet, "新提示", 1200)
+    namespace["hide_comment_bubble"](pet, expected_generation=first)
+    assert calls == [1200]
+    namespace["hide_comment_bubble"](pet, expected_generation=second)
+    assert calls == [1200, "hide"]
 
 
 def test_synthesis_failure_displays_text_through_error_callback():

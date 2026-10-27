@@ -191,6 +191,17 @@ def test_visual_novel_filters_logs_and_gibberish_before_observe():
         assert "gibberish=1" in gibberish_reason
 
 
+def test_visual_novel_keeps_dialogue_with_ellipsis_and_emphasis():
+    with TemporaryDirectory() as temp_dir:
+        tracker = VisualNovelTracker(Path(temp_dir) / 'story.json')
+        for text in ['燐\n「没动静啊。还是先放弃吧……」', '萤\n「嗯......」',
+                     '「我……我不知道啊！！！！」', '「嗯…………」']:
+            prepared, reason = tracker.prepare_ocr_text(text, confidence=.95)
+            assert prepared == text, (text, prepared, reason)
+        for text in ['！！！！！！', '，，，，12331asd']:
+            assert tracker.prepare_ocr_text(text, confidence=.95)[0] == ''
+
+
 def test_visual_novel_filter_keeps_dialogue_when_same_frame_contains_log():
     with TemporaryDirectory() as temp_dir:
         tracker = VisualNovelTracker(Path(temp_dir) / "story.json")
@@ -323,3 +334,49 @@ def test_visual_novel_uses_bottom_dialogue_area_unless_region_is_manual():
 
     assert automatic.size == (100, 42)
     assert manual.size == (100, 100)
+
+def test_evaluation_snapshot_preserves_selection_and_isolates_new_memory():
+    import copy
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    with TemporaryDirectory() as directory:
+        threads=[]
+        def scores(query, texts):
+            threads.append(threading.current_thread().name)
+            return [0.9 if '钥匙' in text else 0.2 for text in texts]
+        tracker=VisualNovelTracker(Path(directory)/'game.json',similarities_fn=scores,summary_batch_size=8)
+        tracker._facts=['旧钥匙在门边。','花园里有一棵树。']
+        tracker._characters={'girl':{'name':'小雨','aliases':[],'known_so_far':['她拿到了钥匙。']}}
+        tracker._lines=[{'id':i,'text':f'第{i}句：小雨正在寻找钥匙。'} for i in range(1,9)]
+        tracker._total_lines=8
+        expected=copy.copy(tracker).build_evaluation_payload()
+        threads.clear()
+        snapshot,reason=tracker.reserve_evaluation_snapshot()
+        assert threads==[] and reason=='summary_due'
+        assert tracker.reserve_evaluation_snapshot() is None
+        tracker._facts.append('新增的证据。')
+        tracker._characters['girl']['known_so_far'].append('下一幕的内容。')
+        tracker._lines[-1]['text']='被修改的台词'
+        tracker._viewer_notes.append('新的印象')
+        with ThreadPoolExecutor(max_workers=1,thread_name_prefix='selection-test') as executor:
+            actual=executor.submit(snapshot.build_evaluation_payload).result()
+        assert actual==expected
+        assert threads and all(name.startswith('selection-test') for name in threads)
+        assert tracker._facts[-1]=='新增的证据。'
+
+
+def test_snapshot_survives_cache_switch_and_reservation_keeps_unread_lines():
+    with TemporaryDirectory() as directory:
+        tracker=VisualNovelTracker(Path(directory)/'old.json',summary_batch_size=8)
+        tracker._lines=[{'id':i,'text':f'第{i}句剧情。'} for i in range(1,9)]
+        tracker._total_lines=8
+        snapshot,_=tracker.reserve_evaluation_snapshot()
+        tracker._lines.append({'id':9,'text':'计算期间的新对白。'})
+        tracker._total_lines=9
+        tracker.apply_evaluation({'scene_summary':'前八句的摘要。','facts':[]})
+        assert tracker.summarized_line_count==8 and tracker.total_lines==9
+        tracker.switch_story(Path(directory)/'new.json')
+        payload=snapshot.build_evaluation_payload()
+        assert payload['line_count']==8 and payload['story_title']=='old'
+        assert '计算期间' not in payload['recent_dialogue']
+        assert tracker.total_lines==0 and tracker.scene_summary==''
