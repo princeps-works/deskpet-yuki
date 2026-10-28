@@ -1,0 +1,249 @@
+diff --git a/GPT_SoVITS/AR/models/t2s_model.py b/GPT_SoVITS/AR/models/t2s_model.py
+index ac905f4..74150a1 100644
+--- a/GPT_SoVITS/AR/models/t2s_model.py
++++ b/GPT_SoVITS/AR/models/t2s_model.py
+@@ -1,6 +1,7 @@
+ # modified from https://github.com/yangdongchao/SoundStorm/blob/master/soundstorm/s1/AR/models/t2s_model.py
+ # reference: https://github.com/lifeiteng/vall-e
+ import math
++from concurrent.futures import CancelledError
+ from typing import List, Optional
+ 
+ import torch
+@@ -699,6 +700,9 @@ class Text2SemanticDecoder(nn.Module):
+         batch_idx_map = list(range(y.shape[0]))
+         idx_list = [None] * y.shape[0]
+         for idx in tqdm(range(1500)):
++            cancel_event = getattr(self, "cancel_event", None)
++            if cancel_event is not None and cancel_event.is_set():
++                raise CancelledError()
+             if idx == 0:
+                 xy_dec, k_cache, v_cache = self.t2s_transformer.process_prompt(xy_pos, attn_mask, None)
+             else:
+@@ -887,6 +891,9 @@ class Text2SemanticDecoder(nn.Module):
+         token_counter = 0
+         curr_ptr = prefix_len
+         for idx in tqdm(range(1500)):
++            cancel_event = getattr(self, "cancel_event", None)
++            if cancel_event is not None and cancel_event.is_set():
++                raise CancelledError()
+             token_counter+=1
+             if xy_attn_mask is not None:
+                 xy_dec, k_cache, v_cache = self.t2s_transformer.process_prompt(xy_pos, xy_attn_mask, None)
+diff --git a/GPT_SoVITS/Accel/PyTorch/AR/structs.py b/GPT_SoVITS/Accel/PyTorch/AR/structs.py
+index 6590ae4..6233c6a 100644
+--- a/GPT_SoVITS/Accel/PyTorch/AR/structs.py
++++ b/GPT_SoVITS/Accel/PyTorch/AR/structs.py
+@@ -7,6 +7,7 @@ from __future__ import annotations
+ from collections.abc import Generator, MutableSequence
+ from dataclasses import dataclass, field
+ from queue import Empty, SimpleQueue
++from threading import Event
+ from typing import TYPE_CHECKING, Literal, Optional, Protocol, Union
+ 
+ import torch
+@@ -50,6 +51,7 @@ class T2SRequest:
+     stream_interval: Optional[int] = None
+     return_partial: bool = True
+     debug: bool = False
++    cancel_event: Optional[Event] = None
+ 
+ 
+ @dataclass
+diff --git a/GPT_SoVITS/Accel/PyTorch/AR/t2s_engine.py b/GPT_SoVITS/Accel/PyTorch/AR/t2s_engine.py
+index 7b611fa..0abfbf9 100644
+--- a/GPT_SoVITS/Accel/PyTorch/AR/t2s_engine.py
++++ b/GPT_SoVITS/Accel/PyTorch/AR/t2s_engine.py
+@@ -2,6 +2,7 @@ from __future__ import annotations
+ 
+ import os
+ import threading
++from concurrent.futures import CancelledError
+ import time
+ import traceback
+ from collections import deque
+@@ -185,7 +186,7 @@ class T2SEngine(T2SEngineProtocol):
+         infer_speed = (session.total_tokens / infer_time if session.total_tokens else 0.0, infer_time)
+         status: Literal["Success", "Error"] = "Error" if exception else "Success"
+ 
+-        if exception:
++        if exception and not isinstance(exception, CancelledError):
+             logger.error(f"T2S request {session.request_id} failed: {exception}")
+             traceback.print_exc()
+ 
+@@ -273,6 +274,16 @@ class T2SEngine(T2SEngineProtocol):
+         torch.set_grad_enabled(False)
+         while not self._stop_event.is_set():
+             self._drain_new_requests()
++            for session in list(self.model_runner.bound_sessions) + list(self.waiting_bind):
++                event = session.request.cancel_event
++                if event is not None and event.is_set():
++                    if session in self.waiting_bind:
++                        self.waiting_bind.remove(session)
++                    else:
++                        steps = max(int(self.model_runner.step_buf[slot].item()) for slot in session.slot_indices)
++                        logger.info(f"Cancelled T2S request {session.request_id} after {steps} decode steps")
++                        self.model_runner.unbind_session(session)
++                    self._finalize_session(session, exception=CancelledError())
+ 
+             if not self.model_runner.bound_sessions:
+                 if not self.waiting_bind:
+diff --git a/GPT_SoVITS/Accel/adapter.py b/GPT_SoVITS/Accel/adapter.py
+index 01a3fbf..80a131c 100644
+--- a/GPT_SoVITS/Accel/adapter.py
++++ b/GPT_SoVITS/Accel/adapter.py
+@@ -90,6 +90,7 @@ class AccelInference:
+         early_stop_num=-1,
+         repetition_penalty=1.35,
+         use_flash_attention=True,
++        cancel_event=None,
+         **kwargs,
+     ):
+         with self._mode_lock:
+@@ -120,6 +121,7 @@ class AccelInference:
+                         use_cuda_graph=self.graph_enabled,
+                         request_id=f"tts-{next(self._request_ids)}",
+                         return_partial=False,
++                        cancel_event=cancel_event,
+                     )
+                 )
+             engine = self.engine
+diff --git a/GPT_SoVITS/TTS_infer_pack/TTS.py b/GPT_SoVITS/TTS_infer_pack/TTS.py
+index 80d1897..e2e8ccf 100644
+--- a/GPT_SoVITS/TTS_infer_pack/TTS.py
++++ b/GPT_SoVITS/TTS_infer_pack/TTS.py
+@@ -1,4 +1,5 @@
+ import gc
++from concurrent.futures import CancelledError
+ import math
+ import os
+ import random
+@@ -1133,6 +1134,10 @@ class TTS:
+         """
+         ########## variables initialization ###########
+         self.stop_flag: bool = False
++        cancel_event = inputs.get("_cancel_event")
++        self.t2s_model.model.cancel_event = cancel_event
++        if cancel_event is not None and cancel_event.is_set():
++            raise CancelledError()
+         text: str = inputs.get("text", "")
+         text_lang: str = inputs.get("text_lang", "")
+         ref_audio_path: str = inputs.get("ref_audio_path", "")
+@@ -1332,6 +1337,8 @@ class TTS:
+             is_first_package = True
+             output_sr = self.configs.sampling_rate if not self.configs.use_vocoder else self.vocoder_configs["sr"]
+             for item in data:
++                if cancel_event is not None and cancel_event.is_set():
++                    raise CancelledError()
+                 t3 = time.perf_counter()
+                 if return_fragment or streaming_mode:
+                     item = make_batch(item)
+@@ -1392,6 +1399,7 @@ class TTS:
+                                 prompt[start:end] if prompt is not None else None,
+                                 all_bert_features[start:end],
+                                 parallel_infer=parallel_infer,
++                                cancel_event=cancel_event,
+                                 use_cuda_graph=use_cuda_graph,
+                                 use_flash_attention=use_flash_attention,
+                                 top_k=top_k,
+@@ -1433,6 +1441,8 @@ class TTS:
+                     # batch_audio_fragment = (self.vits_model.batched_decode(
+                     #         pred_semantic, pred_semantic_len, batch_phones, batch_phones_len,refer_audio_spec
+                     #     ))
++                    if cancel_event is not None and cancel_event.is_set():
++                        raise CancelledError()
+                     print(f"############ {i18n('合成音频')} ############")
+                     if not self.configs.use_vocoder:
+                         if speed_factor == 1.0 and parallel_infer:
+@@ -1652,6 +1662,8 @@ class TTS:
+                     super_sampling if self.configs.use_vocoder and self.configs.version == "v3" else False,
+                 )
+ 
++        except CancelledError:
++            return
+         except Exception as e:
+             traceback.print_exc()
+             # 必须返回一个空音频, 否则会导致显存不释放。
+diff --git a/api_v2.py b/api_v2.py
+index 8a343ad..f42bee3 100644
+--- a/api_v2.py
++++ b/api_v2.py
+@@ -129,6 +129,10 @@ from GPT_SoVITS.TTS_infer_pack.TTS import TTS, TTS_Config
+ from GPT_SoVITS.TTS_infer_pack.text_segmentation_method import get_method_names as get_cut_method_names
+ from pydantic import BaseModel
+ import threading
++from collections import deque
++from concurrent.futures import CancelledError
++from starlette.concurrency import run_in_threadpool
++from uuid import uuid4
+ 
+ # print(sys.path)
+ i18n = I18nAuto()
+@@ -153,9 +157,23 @@ print(tts_config)
+ tts_pipeline = TTS(tts_config)
+ 
+ APP = FastAPI()
++_tts_lock = threading.Lock()
++_tts_jobs = {}
++_cancelled_ids = deque(maxlen=128)
++
++
++@APP.post("/cancel_tts")
++async def cancel_tts(request_id: str):
++    _cancelled_ids.append(request_id)
++    event = _tts_jobs.get(request_id)
++    if event is not None:
++        event.set()
++    return {"cancelled": True, "request_id": request_id}
++
+ 
+ 
+ class TTS_Request(BaseModel):
++    request_id: Optional[str] = None
+     text: str = None
+     text_lang: str = None
+     ref_audio_path: str = None
+@@ -444,9 +462,40 @@ async def tts_handle(req: dict):
+             )
+ 
+         else:
+-            sr, audio_data = next(tts_generator)
+-            audio_data = pack_audio(BytesIO(), audio_data, sr, media_type).getvalue()
+-            return Response(audio_data, media_type=f"audio/{media_type}")
++            request_id = req.get("request_id") or uuid4().hex
++            cancel_event = threading.Event()
++            if request_id in _cancelled_ids:
++                cancel_event.set()
++            _tts_jobs[request_id] = cancel_event
++            req["_cancel_event"] = cancel_event
++
++            def render():
++                while not _tts_lock.acquire(timeout=0.03):
++                    if cancel_event.is_set():
++                        raise CancelledError()
++                try:
++                    if cancel_event.is_set():
++                        raise CancelledError()
++                    try:
++                        sr, audio_data = next(tts_generator)
++                    except StopIteration:
++                        if cancel_event.is_set():
++                            raise CancelledError()
++                        raise RuntimeError("TTS returned no audio")
++                    if cancel_event.is_set():
++                        raise CancelledError()
++                    return pack_audio(BytesIO(), audio_data, sr, media_type).getvalue()
++                finally:
++                    tts_generator.close()
++                    _tts_lock.release()
++
++            try:
++                audio_data = await run_in_threadpool(render)
++                return Response(audio_data, media_type=f"audio/{media_type}")
++            except CancelledError:
++                return JSONResponse(status_code=409, content={"message": "tts cancelled", "request_id": request_id})
++            finally:
++                _tts_jobs.pop(request_id, None)
+     except Exception as e:
+         return JSONResponse(status_code=400, content={"message": "tts failed", "Exception": str(e)})
+ 

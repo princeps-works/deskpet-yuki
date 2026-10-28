@@ -1,0 +1,49 @@
+diff --git a/GPT_SoVITS/text/chinese.py b/GPT_SoVITS/text/chinese.py
+index 944c9cb..2cd6646 100644
+--- a/GPT_SoVITS/text/chinese.py
++++ b/GPT_SoVITS/text/chinese.py
+@@ -16,11 +16,11 @@ pinyin_to_symbol_map = {
+     for line in open(os.path.join(current_file_path, "opencpop-strict.txt")).readlines()
+ }
+ 
+-import jieba_fast
++import jieba as jieba_fast
+ import logging
+ 
+ jieba_fast.setLogLevel(logging.CRITICAL)
+-import jieba_fast.posseg as psg
++import jieba.posseg as psg
+ 
+ 
+ rep_map = {
+diff --git a/GPT_SoVITS/text/chinese2.py b/GPT_SoVITS/text/chinese2.py
+index acfebfe..3f0bc4a 100644
+--- a/GPT_SoVITS/text/chinese2.py
++++ b/GPT_SoVITS/text/chinese2.py
+@@ -17,11 +17,11 @@ pinyin_to_symbol_map = {
+     for line in open(os.path.join(current_file_path, "opencpop-strict.txt")).readlines()
+ }
+ 
+-import jieba_fast
++import jieba as jieba_fast
+ import logging
+ 
+ jieba_fast.setLogLevel(logging.CRITICAL)
+-import jieba_fast.posseg as psg
++import jieba.posseg as psg
+ 
+ # is_g2pw_str = os.environ.get("is_g2pw", "True")##默认开启
+ # is_g2pw = False#True if is_g2pw_str.lower() == 'true' else False
+diff --git a/GPT_SoVITS/text/tone_sandhi.py b/GPT_SoVITS/text/tone_sandhi.py
+index 4ed7378..608d741 100644
+--- a/GPT_SoVITS/text/tone_sandhi.py
++++ b/GPT_SoVITS/text/tone_sandhi.py
+@@ -14,7 +14,7 @@
+ from typing import List
+ from typing import Tuple
+ 
+-import jieba_fast as jieba
++import jieba
+ from pypinyin import lazy_pinyin
+ from pypinyin import Style
+ 

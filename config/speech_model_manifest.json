@@ -1,0 +1,99 @@
+{
+  "files": [
+    {
+      "path": "assets/models/gpt-sovits-pretrained/chinese-hubert-base/config.json",
+      "bytes": 1449,
+      "sha256": "c3e5060a1277e0f078cc6be9da4528a605dba6ece93018981fe2c820e5c7b103"
+    },
+    {
+      "path": "assets/models/gpt-sovits-pretrained/chinese-hubert-base/preprocessor_config.json",
+      "bytes": 212,
+      "sha256": "dcd684124d06722947939d41ea6ae58dbf10968c60a11a29f23ddc602c64a29b"
+    },
+    {
+      "path": "assets/models/gpt-sovits-pretrained/chinese-hubert-base/pytorch_model.bin",
+      "bytes": 188811417,
+      "sha256": "24164f129c66499d1346e2aa55f183250c223161ec2770c0da3d3b08cf432d3c"
+    },
+    {
+      "path": "assets/models/gpt-sovits-pretrained/chinese-roberta-wwm-ext-large/config.json",
+      "bytes": 963,
+      "sha256": "3d57de2fd7e80d0e5c8ff194f0bbb6baa10df7e43fc262a0cc71298a78b0a3e5"
+    },
+    {
+      "path": "assets/models/gpt-sovits-pretrained/chinese-roberta-wwm-ext-large/pytorch_model.bin",
+      "bytes": 651225145,
+      "sha256": "e53a693acc59ace251d143d068096ae0d7b79e4b1b503fa84c9dcf576448c1d8"
+    },
+    {
+      "path": "assets/models/gpt-sovits-pretrained/chinese-roberta-wwm-ext-large/tokenizer.json",
+      "bytes": 268962,
+      "sha256": "173796956820ea27bd14f76bf28162607ff4254807e2948253eb5b46f5bb643b"
+    },
+    {
+      "path": "assets/models/gpt-sovits-pretrained/fast_langdetect/lid.176.bin",
+      "bytes": 131266198,
+      "sha256": "7e69ec5451bc261cc7844e49e4792a85d7f09c06789ec800fc4a44aec362764e"
+    },
+    {
+      "path": "assets/models/gpt-sovits-pretrained/sv/pretrained_eres2netv2w24s4ep4.ckpt",
+      "bytes": 107528697,
+      "sha256": "4f5a0bf73c61eb41b174e1bb54e7ee3c83233892be8e0af1f187024e8e581a35"
+    },
+    {
+      "path": "VOICE_model/GPT_weights_v2ProPlus/tsumugi/references.json",
+      "bytes": 1562,
+      "sha256": "587cd55272d25c3fe72db2634218232109da5d35c034625c3fb1a6d372973c76"
+    },
+    {
+      "path": "VOICE_model/GPT_weights_v2ProPlus/tsumugi/reference_01.wav",
+      "bytes": 309862,
+      "sha256": "bd80fcf6140d584a62b6e4c07f441deb005f05c3ac060f81b9109746fc949db8"
+    },
+    {
+      "path": "VOICE_model/GPT_weights_v2ProPlus/tsumugi/reference_02.wav",
+      "bytes": 419718,
+      "sha256": "f4ad053641dc1d2b52e764de92a3e5912aa89f2d5a9d6803920c0bf9f21a4474"
+    },
+    {
+      "path": "VOICE_model/GPT_weights_v2ProPlus/tsumugi/reference_03.wav",
+      "bytes": 337230,
+      "sha256": "63ba0fe43aeeb99f7d9c30093cef7d721b4c9595d9c43d2d858ff4e493723474"
+    },
+    {
+      "path": "VOICE_model/GPT_weights_v2ProPlus/tsumugi/reference_04.wav",
+      "bytes": 701846,
+      "sha256": "b8f902f967f70e356fb9a7ffc4ecab4199769909ebc8286d25566b5a74b26eef"
+    },
+    {
+      "path": "VOICE_model/GPT_weights_v2ProPlus/tsumugi/reference_05.wav",
+      "bytes": 588070,
+      "sha256": "c6a425327d069a671f8d85c2694ab1724ff6ef376666b295b338af8595e022ec"
+    },
+    {
+      "path": "VOICE_model/GPT_weights_v2ProPlus/tsumugi/reference_06.wav",
+      "bytes": 445206,
+      "sha256": "6218861dfeed431fc9ed6827868e93fe0bb2cfedf10dcdedd17245ee192ec002"
+    },
+    {
+      "path": "VOICE_model/GPT_weights_v2ProPlus/tsumugi/reference_07.wav",
+      "bytes": 664758,
+      "sha256": "0fe4bc6fe8500d18ff995c4a286d33a425851360167e3149232200334603226c"
+    },
+    {
+      "path": "VOICE_model/GPT_weights_v2ProPlus/tsumugi/reference_08.wav",
+      "bytes": 565766,
+      "sha256": "8c1607c648188778aae502b87df64e0c058f48bb9dcf865e47a3a81b73944e90"
+    },
+    {
+      "path": "VOICE_model/GPT_weights_v2ProPlus/tsumugi/tsumugi-e25.ckpt",
+      "bytes": 155312893,
+      "sha256": "68cdc0062d2aa416de932951b2d7bab180c2bd119ae03babffc0574cb0cc6e64"
+    },
+    {
+      "path": "VOICE_model/GPT_weights_v2ProPlus/tsumugi/tsumugi_e6_s438.pth",
+      "bytes": 172765030,
+      "sha256": "87f473487cdd1a0dd8b7b7454df08f61a6638178befa2bee7687dba60c034a5e"
+    }
+  ]
+}

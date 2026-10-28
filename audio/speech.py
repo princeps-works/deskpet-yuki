@@ -47,6 +47,9 @@ class _SpeechTask:
     is_valid: Optional[Callable[[], bool]] = None
     on_ready: Optional[Callable[[], bool]] = None
     on_end: Optional[Callable[[], None]] = None
+    priority: int = 0
+    started: bool = False
+    cancelled: threading.Event = field(default_factory=threading.Event, repr=False)
     _end_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def finish(self) -> None:
@@ -100,6 +103,8 @@ class SpeechService:
         self._lock = threading.Lock()
         self._generation = 0
         self._active_generation = 0
+        self._active_task = None
+        self._latest_comment_task = None
         self._azure_synthesizer = None
         self._voicevox_status_detail = ""
         # pid of an engine this process launched, so the CPU-policy code does not
@@ -162,6 +167,15 @@ class SpeechService:
                 self._gpt_sovits_status = "pygame not installed"
                 return False
             ready, self._gpt_sovits_status = self._gpt_sovits.check_ready()
+            if ready:
+                # Startup and recovery both finish graph capture before starting playback.
+                started = time.perf_counter()
+                try:
+                    self._gpt_sovits.synthesize(self._gpt_sovits.reference_text)
+                except (URLError, TimeoutError, ConnectionError, ValueError) as exc:
+                    self._gpt_sovits_status = f"GPT-SoVITS warmup failed: {type(exc).__name__}; awaiting recovery"
+                    return False
+                print(f"[STARTUP] GPT-SoVITS synthesis warmed (CUDA Graph requested), elapsed={time.perf_counter() - started:.3f}s", flush=True)
             return ready
         if self._provider == "azure":
             has_auth = bool(self._azure_key) and (bool(self._azure_region) or bool(self._azure_endpoint))
@@ -321,7 +335,8 @@ class SpeechService:
               on_error: Optional[Callable[[], None]] = None,
               is_valid: Optional[Callable[[], bool]] = None,
               on_ready: Optional[Callable[[], bool]] = None,
-              on_end: Optional[Callable[[], None]] = None) -> bool:
+              on_end: Optional[Callable[[], None]] = None,
+              priority: int = 0) -> bool:
         if not self._runtime_ok:
             return False
         if self._muted:
@@ -331,20 +346,32 @@ class SpeechService:
             return False
         if is_valid is not None and not is_valid():
             return False
-        self.stop_current()
-        self._clear_queue()
         self._diag_log(f"enqueue provider={self._provider} chars={len(cleaned)}")
+        interrupted = None
         with self._lock:
-            self._queue.put(_SpeechTask(cleaned, on_start=on_start, on_error=on_error,
-                                       generation=self._generation, is_valid=is_valid,
-                                       on_ready=on_ready, on_end=on_end))
+            active = getattr(self, "_active_task", None)
+            if priority > 0 and (active is None or active.cancelled.is_set()):
+                self._generation += 1  # Also invalidate a lower-priority task already dequeued by the worker.
+            if (active is not None and not active.cancelled.is_set()
+                    and (priority > active.priority or (priority == active.priority and not active.started))):
+                interrupted = self._interrupt_locked()
+            removed = self._clear_queue(priority)
+            task = _SpeechTask(cleaned, on_start=on_start, on_error=on_error,
+                               generation=self._generation, is_valid=is_valid,
+                               on_ready=on_ready, on_end=on_end, priority=priority)
+            if priority == 0:
+                self._latest_comment_task = task
+            self._queue.put(task)
+        for old in removed + ([interrupted] if interrupted is not None else []):
+            old.finish()
         return True
 
     def set_muted(self, muted: bool) -> None:
         self._muted = muted
         if muted:
             self.stop_current()
-            self._clear_queue()
+            for task in self._clear_queue():
+                task.finish()
 
     def is_muted(self) -> bool:
         return self._muted
@@ -353,40 +380,48 @@ class SpeechService:
         if not self._runtime_ok and getattr(self, "_worker", None) is None:
             return
         with self._lock:
-            self._generation += 1
-            active_task = getattr(self, "_active_task", None)
-            if self._provider == "edge":
-                try:
-                    if pygame.mixer.get_init() and pygame.mixer.music.get_busy():
-                        pygame.mixer.music.stop()
-                except Exception:
-                    pass
-            elif self._provider in {"voicevox", "gpt_sovits"}:
-                try:
-                    if pygame.mixer.get_init() and pygame.mixer.music.get_busy():
-                        pygame.mixer.music.stop()
-                except Exception:
-                    pass
-            elif self._provider == "azure":
-                try:
-                    synth = self._get_azure_synthesizer()
-                    if synth is not None:
-                        synth.stop_speaking_async()
-                except Exception:
-                    pass
-
+            active_task = self._interrupt_locked()
         if active_task is not None:
             active_task.finish()
 
-    def _clear_queue(self) -> None:
+    def _interrupt_locked(self):
+        self._generation += 1
+        active = getattr(self, "_active_task", None)
+        if active is not None:
+            active.cancelled.set()
+        if self._provider in {"edge", "voicevox", "gpt_sovits"}:
+            try:
+                if pygame.mixer.get_init() and pygame.mixer.music.get_busy():
+                    pygame.mixer.music.stop()
+            except Exception:
+                pass
+        elif self._provider == "azure":
+            try:
+                synth = self._get_azure_synthesizer()
+                if synth is not None:
+                    synth.stop_speaking_async()
+            except Exception:
+                pass
+        return active
+
+    def _clear_queue(self, max_priority: int = 1) -> list:
+        removed, keep = [], []
         while True:
             try:
                 item = self._queue.get_nowait()
                 if item is None:
-                    self._queue.put(None)
+                    keep.append(None)
                     break
+                if item.priority <= max_priority:
+                    item.cancelled.set()
+                    removed.append(item)
+                else:
+                    keep.append(item)
             except queue.Empty:
                 break
+        for item in keep:
+            self._queue.put(item)
+        return removed
 
     def shutdown(self) -> None:
         recovery_stop = getattr(self, "_recovery_stop", None)
@@ -394,6 +429,8 @@ class SpeechService:
             with self._lock:
                 recovery_stop.set()
         self.stop_current()
+        for task in self._clear_queue():
+            task.finish()
         self._queue.put(None)
         if self._worker and self._worker.is_alive():
             self._worker.join(timeout=2)
@@ -410,11 +447,20 @@ class SpeechService:
             task = self._queue.get()
             if task is None:
                 return
-            self._active_task = task
-            self._active_generation = task.generation
-            self._active_valid = task.is_valid
-            self._active_on_ready = task.on_ready
+            with self._lock:
+                latest = getattr(self, "_latest_comment_task", None)
+                if task.priority == 0 and latest is not None and task is not latest:
+                    task.cancelled.set()
+                self._active_task = task
+                self._active_generation = task.generation
+                self._active_valid = task.is_valid
+                self._active_on_ready = task.on_ready
             if not self._is_current():
+                task.cancelled.set()
+                with self._lock:
+                    if self._active_task is task:
+                        self._active_task = None
+                task.finish()
                 continue
             started_ts = time.perf_counter()
             try:
@@ -444,10 +490,15 @@ class SpeechService:
                     self._notify_on_start(task.on_error or task.on_start)
             finally:
                 task.finish()
+                with self._lock:
+                    if self._active_task is task:
+                        self._active_task = None
 
     def _is_current(self) -> bool:
         valid = getattr(self, "_active_valid", None)
+        task = getattr(self, "_active_task", None)
         return (self._active_generation == self._generation and not self._muted
+                and (task is None or not task.cancelled.is_set())
                 and (valid is None or valid()))
 
     def _speak_once(self, text: str, on_start: Optional[Callable[[], None]] = None) -> None:
@@ -465,6 +516,9 @@ class SpeechService:
 
     def _notify_on_start(self, on_start: Optional[Callable[[], None]]) -> None:
         self._active_valid = None  # Once playback begins, finish the whole comment.
+        task = getattr(self, "_active_task", None)
+        if task is not None:
+            task.started = True
         if on_start is None:
             return
         try:
@@ -529,7 +583,9 @@ class SpeechService:
             if not self._is_current():
                 return b""
             started = time.perf_counter()
-            audio = self._gpt_sovits.synthesize(part)
+            task = getattr(self, "_active_task", None)
+            audio = (self._gpt_sovits.synthesize(part, cancel_event=task.cancelled, is_valid=self._is_current)
+                     if task is not None else self._gpt_sovits.synthesize(part))
             self._diag_log(f"gpt_sovits synthesis={time.perf_counter() - started:.3f}s chars={len(part)}")
             return audio
         if not parts:

@@ -6,6 +6,8 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import patch
 import queue
+from concurrent.futures import CancelledError
+from urllib.error import HTTPError
 from urllib.error import URLError
 
 from desktop_pet.audio.gpt_sovits import GPTSoVITSClient
@@ -77,6 +79,7 @@ def test_unavailable_speech_recovers_once_in_background_and_can_shutdown():
 
 def test_service_loss_marks_offline_and_finishes_current_comment():
     service = SpeechService.__new__(SpeechService)
+    service._lock = threading.Lock()
     service._provider = "gpt_sovits"
     service._runtime_ok = service._enabled = True
     service._diag = service._muted = False
@@ -136,7 +139,7 @@ def test_gpt_sovits_checks_reference_and_api_identity():
         ref.write_bytes(b"reference")
         client._opener = FakeOpener(b'{"paths":{"/unrelated":{}}}')
         assert not client.check_ready()[0]
-        client._opener = FakeOpener(b'{"paths":{"/tts":{}}}')
+        client._opener = FakeOpener(b'{"paths":{"/tts":{},"/cancel_tts":{}}}')
         assert client.check_ready()[0]
 
 
@@ -149,6 +152,7 @@ def test_gpt_sovits_requests_japanese_with_reference_and_rejects_json():
     assert payload["ref_audio_path"] == "ref.wav"
     assert payload["prompt_text"] == "こんにちは。"
     assert payload["streaming_mode"] is False
+    assert payload["use_cuda_graph"] is True
     client._opener = FakeOpener(b'{"error":"failed"}')
     try:
         client.synthesize("テスト")
@@ -156,6 +160,68 @@ def test_gpt_sovits_requests_japanese_with_reference_and_rejects_json():
         pass
     else:
         raise AssertionError("non-audio response accepted")
+
+
+def test_cancellation_reaches_server_while_synthesis_request_is_blocked():
+    client = GPTSoVITSClient("http://127.0.0.1:9880", "ref.wav", "こんにちは。")
+    started, cancel, acknowledged = threading.Event(), threading.Event(), threading.Event()
+    events = []
+    class Opener:
+        def open(self, request, timeout):
+            if "/cancel_tts?" in request.full_url:
+                events.append(request.full_url.split("request_id=")[1])
+                acknowledged.set()
+                return io.BytesIO(b'{}')
+            events.append(json.loads(request.data)["request_id"])
+            started.set()
+            assert acknowledged.wait(2)
+            raise HTTPError(request.full_url, 409, "cancelled", {}, None)
+    client._opener = Opener()
+    outcomes = []
+    def synthesize():
+        try:
+            client.synthesize("テスト", cancel_event=cancel)
+        except CancelledError:
+            outcomes.append("cancelled")
+    worker = threading.Thread(target=synthesize)
+    worker.start()
+    assert started.wait(2)
+    cancel.set()
+    worker.join(3)
+    assert not worker.is_alive()
+    assert outcomes == ["cancelled"] and len(events) == 2 and events[0] == events[1]
+
+
+def test_gpt_sovits_ready_requires_silent_synthesis_warmup():
+    service = SpeechService.__new__(SpeechService)
+    service._enabled = True
+    service._provider = "gpt_sovits"
+    calls = []
+    def synthesize(text):
+        calls.append(text)
+        assert text == "こんにちは。"
+    service._gpt_sovits = SimpleNamespace(
+        check_ready=lambda: (True, "ok"), reference_text="こんにちは。", synthesize=synthesize)
+    with patch.object(speech_module, "pygame", object()):
+        assert service._compute_runtime_ok()
+        assert calls == ["こんにちは。"]
+        service._gpt_sovits.check_ready = lambda: (False, "offline")
+        assert not service._compute_runtime_ok()
+        assert calls == ["こんにちは。"]
+
+
+def test_gpt_sovits_warmup_failure_waits_for_recovery_before_voice_is_ready():
+    service = SpeechService.__new__(SpeechService)
+    service._enabled = True
+    service._provider = "gpt_sovits"
+    def fail(_):
+        raise URLError("service stopped during warmup")
+    service._gpt_sovits = SimpleNamespace(
+        check_ready=lambda: (True, "ok"), reference_text="こんにちは。", synthesize=fail)
+    with patch.object(speech_module, "pygame", object()):
+        assert not service._compute_runtime_ok()
+        assert "warmup failed" in service._gpt_sovits_status
+        assert "awaiting recovery" in service._gpt_sovits_status
 
 
 def test_gpt_sovits_does_not_play_or_display_cancelled_synthesis():

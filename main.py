@@ -1971,7 +1971,7 @@ def main() -> int:
     def _speak_async(display_text: str) -> None:
         if speech.is_muted():
             return
-        speech.speak(display_text)
+        speech.speak(display_text, priority=1)
 
     def _speak_async_with_callback(display_text: str, on_start=None, on_error=None, is_valid=None, on_ready=None, on_end=None) -> None:
         if is_valid is not None and not is_valid():
@@ -2058,6 +2058,8 @@ def main() -> int:
             return shown_state["done"]
 
         def _playback_ended():
+            if not shown_state["started"]:
+                shown_state["cancelled"] = True
             print(f"[SPEECH-SYNC] playback_ended wait_ms={(time.perf_counter() - queued_at) * 1000:.1f}")
             def hide():
                 if shown_state["sustained"] and shown_state["bubble_id"] is not None:
@@ -2066,6 +2068,8 @@ def main() -> int:
             speech_ui.ready.emit(hide)
 
         def _ready(reason):
+            if shown_state["cancelled"]:
+                return
             if reason == "playback_started":
                 shown_state["started"] = True
             print(f"[SPEECH-SYNC] {reason} wait_ms={(time.perf_counter() - queued_at) * 1000:.1f}")

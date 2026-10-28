@@ -2,6 +2,7 @@
 .env.*
 !.env.example
 .vscode/
+.venv/
 __pycache__/
 *.py[cod]
 
@@ -9,7 +10,15 @@ assets/models/m2m100_418M_ct2/
 assets/models/index_translate_2b/
 tools/llama_cpp/
 tools/gpt_sovits/
-VOICE_model/
+VOICE_model/*
+!VOICE_model/GPT_weights_v2ProPlus/
+VOICE_model/GPT_weights_v2ProPlus/*
+!VOICE_model/GPT_weights_v2ProPlus/tsumugi/
+VOICE_model/GPT_weights_v2ProPlus/tsumugi/*
+!VOICE_model/GPT_weights_v2ProPlus/tsumugi/*.ckpt
+!VOICE_model/GPT_weights_v2ProPlus/tsumugi/*.pth
+!VOICE_model/GPT_weights_v2ProPlus/tsumugi/reference_*.wav
+!VOICE_model/GPT_weights_v2ProPlus/tsumugi/references.json
 assets/models/bge-small-zh-v1.5-onnx/
 stanza_resources/
 

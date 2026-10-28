@@ -94,6 +94,7 @@ def test_speech_end_callback_runs_after_all_segments_and_on_cancellation():
     for cancel in (False, True):
         calls = []
         service = SpeechService.__new__(SpeechService)
+        service._lock = threading.Lock()
         service._generation = service._active_generation = 0
         service._muted = False
         service._diag = False
@@ -133,6 +134,7 @@ def test_bubble_end_does_not_hide_a_replacement_and_speech_has_no_timer():
 
 def test_synthesis_failure_displays_text_through_error_callback():
     service = SpeechService.__new__(SpeechService)
+    service._lock = threading.Lock()
     service._generation = 0
     service._active_generation = 0
     service._muted = False

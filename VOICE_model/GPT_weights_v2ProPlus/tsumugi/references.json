@@ -1,0 +1,42 @@
+[
+  {
+    "audio": "VOICE_model/GPT_weights_v2ProPlus/tsumugi/reference_01.wav",
+    "text": "あなたが知っているから、ここにあるんです。",
+    "language": "ja"
+  },
+  {
+    "audio": "VOICE_model/GPT_weights_v2ProPlus/tsumugi/reference_02.wav",
+    "text": "おーてっきりあれで終わりだと思ってました",
+    "language": "ja"
+  },
+  {
+    "audio": "VOICE_model/GPT_weights_v2ProPlus/tsumugi/reference_03.wav",
+    "text": "これがあれば私は一人でもやっていけます",
+    "language": "ja"
+  },
+  {
+    "audio": "VOICE_model/GPT_weights_v2ProPlus/tsumugi/reference_04.wav",
+    "text": "ただですね、結婚を前提としてということならば、その……",
+    "language": "ja"
+  },
+  {
+    "audio": "VOICE_model/GPT_weights_v2ProPlus/tsumugi/reference_05.wav",
+    "text": "どこかで迷子になっているつむぎちゃんに、こっちだよって、知らせるために",
+    "language": "ja"
+  },
+  {
+    "audio": "VOICE_model/GPT_weights_v2ProPlus/tsumugi/reference_06.wav",
+    "text": "ハイリさんもさっきの…なんと言いますか…",
+    "language": "ja"
+  },
+  {
+    "audio": "VOICE_model/GPT_weights_v2ProPlus/tsumugi/reference_07.wav",
+    "text": "怖いのではなくて、男の人の裸、恥ずかしいんです。",
+    "language": "ja"
+  },
+  {
+    "audio": "VOICE_model/GPT_weights_v2ProPlus/tsumugi/reference_08.wav",
+    "text": "私には高原さんからいただいたパリングルスを集める知恵があります",
+    "language": "ja"
+  }
+]
